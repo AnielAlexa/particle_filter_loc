@@ -117,29 +117,52 @@ class ParticleFilter:
     # Observation updates
     # ------------------------------------------------------------------
 
-    def update_coarse(self, top_k_patches: List[Tuple[float, float, float]]):
-        """Update weights from coarse matches. Each tuple: (east, north, similarity)."""
+    def update_coarse(self, top_k_patches: List[Tuple[float, float, float]],
+                      temperature: float = 0.05):
+        """Update weights from coarse matches using a Gaussian mixture model.
+
+        Each tuple: (east, north, similarity).
+        The K patches are treated as K components of a single mixture observation:
+            p(z | x_i) = sum_k  w_k * N(x_i; mu_k, sigma²)
+        where w_k = softmax(sim_k / T) — sim scores select which patch to believe,
+        not how much total evidence there is.  This avoids double-counting when
+        multiple patches cluster together.
+        """
         if self.particles is None or len(top_k_patches) == 0:
             return
 
-        sigma2 = 2.0 * self.cfg.sigma_obs_coarse ** 2
-        log_weights = np.log(self.weights + 1e-300)
+        sims = np.array([s for _, _, s in top_k_patches], dtype=np.float64)
+        # Softmax mixture weights over the K candidates
+        log_mix = sims / temperature
+        log_mix -= log_mix.max()
+        mix_w = np.exp(log_mix)
+        mix_w /= mix_w.sum()  # [K]
 
-        for east, north, sim in top_k_patches:
+        sigma2 = 2.0 * self.cfg.sigma_obs_coarse ** 2
+        N = len(self.particles)
+
+        # log p(z | x_i) = logsumexp_k [ log(mix_w[k]) - dist(x_i, mu_k)^2 / sigma2 ]
+        # Shape: [N, K]
+        log_components = np.empty((N, len(top_k_patches)), dtype=np.float64)
+        for k, (east, north, _) in enumerate(top_k_patches):
             dx = self.particles[:, 0] - east
             dy = self.particles[:, 1] - north
-            dist2 = dx ** 2 + dy ** 2
-            log_likelihood = np.log(max(sim, 1e-6)) - dist2 / sigma2
-            log_weights += log_likelihood
+            log_components[:, k] = np.log(mix_w[k] + 1e-300) - (dx**2 + dy**2) / sigma2
 
-        # Convert back, normalize
+        # logsumexp over K for each particle
+        lse_max = log_components.max(axis=1, keepdims=True)
+        log_likelihood = lse_max.squeeze(1) + np.log(
+            np.exp(log_components - lse_max).sum(axis=1) + 1e-300
+        )
+
+        log_weights = np.log(self.weights + 1e-300) + log_likelihood
         log_weights -= log_weights.max()
         self.weights = np.exp(log_weights)
         total = self.weights.sum()
         if total > 0:
             self.weights /= total
         else:
-            self.weights = np.full(len(self.weights), 1.0 / len(self.weights))
+            self.weights = np.full(N, 1.0 / N)
 
     def update_fine(self, fine_east: float, fine_north: float, inliers: int,
                     heading_deg: Optional[float] = None):

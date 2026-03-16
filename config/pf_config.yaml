@@ -22,7 +22,7 @@ particle_filter:
   # Adaptive search (driven by particle spread)
   min_search_radius_m: 40.0
   search_radius_multiplier: 2.5
-  base_context_fraction: 0.25
+  base_context_fraction: 0.1
   max_context_fraction: 1.0
 
 matchers:
@@ -39,10 +39,14 @@ matchers:
   camera_fx: 190.0
   camera_fy: 190.0
   context_enabled: true
-  context_fraction: 0.4
+  context_fraction: 0.1
   fine_conf_threshold: 0.20
   min_inliers_ransac: 4
   min_inliers: 8
+
+init:
+  lock_n_frames: 4          # consecutive top-1 hits before seeding
+  lock_sim_threshold: 0.40  # minimum sim to count as a hit
 
 replay:
   mcap_path: "/media/aniel/storage/bags_jetson/095c6d2c7237fe986c6240628b6ef8dd/Day2.6_0.mcap"

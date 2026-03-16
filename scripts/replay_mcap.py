@@ -77,15 +77,25 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
         save_dir=debug_frames_dir,
     )
 
+    # Coarse-lock parameters (pre-seed accumulator)
+    lock_n_frames    = cfg.get("init", {}).get("lock_n_frames", 4)
+    lock_sim_thresh  = cfg.get("init", {}).get("lock_sim_threshold", 0.40)
+
     # State
     altitude_buf = deque(maxlen=10)
     gt_lat, gt_lon = None, None
     camera_frame_idx = 0
     initialized = False
-    first_init_camera = True
     results = []
     t_start = None
     tracking_start_ts = None
+    fine_attempted = 0
+    fine_succeeded = 0
+
+    # Pre-seed coarse-lock state
+    _lock_patch: str = ""          # current candidate patch
+    _lock_count: int = 0           # consecutive hits on that patch
+    _lock_sims:  list = []         # sim scores during the lock streak
 
     print("Starting replay...")
 
@@ -152,16 +162,38 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
 
             t_frame_start = time.monotonic()
 
-            # --- First frame after init: seed PF from full-DB coarse ---
-            if pf.phase == Phase.UNINIT and first_init_camera:
-                first_init_camera = False
-                coarse = obs.coarse_match(frame_bgr, candidate_indices=None, top_k=pf_config.top_k_coarse)
-                centers_enu = [obs.get_patch_center_enu(n) for n in coarse.top_k_names]
-                pf.seed_from_coarse(centers_enu, coarse.top_k_sims)
-                print(f"  PF seeded from coarse: top-1={coarse.top_k_names[0]} sim={coarse.top_k_sims[0]:.3f}")
-                continue
-
+            # --- Pre-seed: accumulate coarse-lock before committing PF ---
             if pf.phase == Phase.UNINIT:
+                coarse = obs.coarse_match(frame_bgr, candidate_indices=None,
+                                          top_k=pf_config.top_k_coarse)
+                top1_name = coarse.top_k_names[0] if coarse.top_k_names else ""
+                top1_sim  = coarse.top_k_sims[0]  if coarse.top_k_sims  else 0.0
+
+                if top1_name == _lock_patch and top1_sim >= lock_sim_thresh:
+                    _lock_count += 1
+                    _lock_sims.append(top1_sim)
+                else:
+                    # Reset streak — new candidate
+                    _lock_patch = top1_name
+                    _lock_count = 1
+                    _lock_sims  = [top1_sim] if top1_sim >= lock_sim_thresh else []
+
+                print(f"  [UNINIT] top1={top1_name} sim={top1_sim:.3f}  "
+                      f"lock={_lock_count}/{lock_n_frames}")
+
+                if _lock_count >= lock_n_frames and len(_lock_sims) >= lock_n_frames:
+                    # Confirmed lock — seed PF with spread tightened by sqrt(N)
+                    mean_sim = float(np.mean(_lock_sims))
+                    tight_sigma = pf_config.sigma_obs_coarse / np.sqrt(_lock_count)
+                    centers_enu = [obs.get_patch_center_enu(n) for n in coarse.top_k_names]
+                    # Temporarily override seed spread
+                    orig_sigma = pf_config.sigma_obs_coarse
+                    pf_config.sigma_obs_coarse = tight_sigma
+                    pf.seed_from_coarse(centers_enu, coarse.top_k_sims)
+                    pf_config.sigma_obs_coarse = orig_sigma
+                    print(f"  PF seeded after {_lock_count}-frame lock: "
+                          f"patch={_lock_patch}  mean_sim={mean_sim:.3f}  "
+                          f"seed_sigma={tight_sigma:.1f}m")
                 continue
 
             # --- Coarse match (adaptive radius) ---
@@ -203,6 +235,7 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
                 fine_top_k = pf.get_fine_top_k()
                 ctx_frac = pf.get_context_fraction()
                 candidates_to_try = coarse.top_k_names[:fine_top_k]
+                fine_attempted += 1
 
                 for cand_name in candidates_to_try:
                     fine_result = obs.fine_match(frame_bgr, cand_name, context_fraction=ctx_frac)
@@ -210,10 +243,9 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
                         break
 
                 if fine_result is not None:
+                    fine_succeeded += 1
                     fe, fn = enu.wgs84_to_enu(fine_result.lat, fine_result.lon)
                     pf.update_fine(fe, fn, fine_result.inliers, fine_result.heading_deg)
-                    # Cache fine result in visualizer (keypoints not available here,
-                    # but method/inliers are)
                     viz.fine_method = fine_result.method
                     viz.fine_inliers = fine_result.inliers
 
@@ -259,10 +291,11 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
             })
 
             if camera_frame_idx % 10 == 0:
+                fine_rate = f"{fine_succeeded}/{fine_attempted}" if fine_attempted else "0/0"
                 print(f"  [{elapsed_s:6.1f}s] frame={camera_frame_idx:4d}  "
                       f"phase={pf.phase.name:11s}  error={error_m:6.1f}m  "
                       f"spread={spread:5.1f}m  ESS={ess:5.1f}  "
-                      f"t={t_frame_ms:5.1f}ms")
+                      f"fine={fine_rate}  t={t_frame_ms:5.1f}ms")
 
     bag_file.close()
     viz.close()
@@ -300,6 +333,8 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
         convergence_s = (tracking_start_ts - t_start) * 1e-9
         print(f"Time to TRACKING: {convergence_s:.1f}s")
     print(f"Total frames processed: {len(results)}")
+    print(f"Fine match rate: {fine_succeeded}/{fine_attempted} "
+          f"({100*fine_succeeded/max(fine_attempted,1):.1f}%)")
 
     # --- Plot ---
     try:
