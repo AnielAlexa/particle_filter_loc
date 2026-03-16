@@ -42,7 +42,8 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
     # Components
     pf = ParticleFilter(pf_config)
     motion = RTKMotionModel()
-    obs = ObservationModel(cfg["matchers"], enu)
+    matchers_cfg = cfg["matchers"]
+    obs = ObservationModel(matchers_cfg, enu)
 
     # Replay config
     rcfg = cfg["replay"]
@@ -52,6 +53,7 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
     yaw_topic = rcfg["yaw_topic"]
     altimeter_topic = rcfg["altimeter_topic"]
     camera_subsample = rcfg.get("camera_subsample", 1)
+    start_offset_s   = rcfg.get("start_offset_s", 0.0)
     output_csv = Path(PKG_DIR) / rcfg["output_csv"]
     output_plot = Path(PKG_DIR) / rcfg["output_plot"]
 
@@ -105,6 +107,10 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
 
         if t_start is None:
             t_start = ts_ns
+
+        # Skip messages before start offset
+        if (ts_ns - t_start) * 1e-9 < start_offset_s:
+            continue
 
         # --- Altimeter ---
         if topic == altimeter_topic:
@@ -296,6 +302,18 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
                       f"phase={pf.phase.name:11s}  error={error_m:6.1f}m  "
                       f"spread={spread:5.1f}m  ESS={ess:5.1f}  "
                       f"fine={fine_rate}  t={t_frame_ms:5.1f}ms")
+
+                # Patch vs RTK coordinate comparison (raw = before any offset correction)
+                top1 = coarse.top_k_names[0] if coarse.top_k_names else ""
+                if top1 and gt_lat is not None:
+                    p = obs.gps_metadata.get(top1, {})
+                    p_lat = p.get("lat", 0.0)
+                    p_lon = p.get("lon", 0.0)
+                    dlat_m = (gt_lat - p_lat) * 111320
+                    dlon_m = (gt_lon - p_lon) * 111320 * 0.7071
+                    print(f"    patch {top1:12s}  ({p_lat:.6f}, {p_lon:.6f})")
+                    print(f"    RTK               ({gt_lat:.6f}, {gt_lon:.6f})")
+                    print(f"    delta             N={dlat_m:+.1f}m  E={dlon_m:+.1f}m")
 
     bag_file.close()
     viz.close()

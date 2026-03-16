@@ -22,7 +22,7 @@ particle_filter:
   # Adaptive search (driven by particle spread)
   min_search_radius_m: 40.0
   search_radius_multiplier: 2.5
-  base_context_fraction: 0.1
+  base_context_fraction: 0.2
   max_context_fraction: 1.0
 
 matchers:
@@ -54,6 +54,7 @@ replay:
   rtk_topic: "/m300/rtk/fix"
   yaw_topic: "/m300/rtk/yaw"
   altimeter_topic: "/altimeter/range"
+  start_offset_s: 55.0        # skip this many seconds from bag start
   camera_subsample: 1
   output_csv: "results/pf_results.csv"
   output_plot: "results/pf_trajectory.png"

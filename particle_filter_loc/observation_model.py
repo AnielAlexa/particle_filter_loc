@@ -93,6 +93,18 @@ class ObservationModel:
         with open(str(meta_path)) as f:
             self.gps_metadata: Dict = json.load(f)
 
+        # Apply geolocation offset if provided (corrects satellite imagery bias vs RTK)
+        lat_off = config.get("gps_offset_lat", 0.0)
+        lon_off = config.get("gps_offset_lon", 0.0)
+        if lat_off != 0.0 or lon_off != 0.0:
+            for entry in self.gps_metadata.values():
+                entry["lat"] += lat_off
+                entry["lon"] += lon_off
+                b = entry["bounds"]
+                b["min_lat"] += lat_off;  b["max_lat"] += lat_off
+                b["min_lon"] += lon_off;  b["max_lon"] += lon_off
+            print(f"GPS offset applied: +{lat_off*111320:.1f}m N, +{lon_off*111320*0.707:.1f}m E")
+
         # Pre-compute patch centers in ENU
         self._patch_enu: List[Tuple[float, float]] = []
         for name in self.patch_names:
