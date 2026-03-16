@@ -1,0 +1,55 @@
+enu_origin:
+  lat: 45.7896
+  lon: 21.1928
+
+particle_filter:
+  n_dispersed: 200
+  n_tracking: 100
+  sigma_pos_dispersed: 3.0
+  sigma_pos_tracking: 1.0
+  sigma_hdg_dispersed: 10.0
+  sigma_hdg_tracking: 3.0
+  sigma_obs_coarse: 50.0
+  sigma_obs_fine: 5.0
+  top_k_coarse: 5
+  ess_threshold_fraction: 0.5
+  init_altitude_m: 15.0
+  converge_spread_m: 80.0
+  tracking_spread_m: 20.0
+  lost_spread_m: 150.0
+  fine_every_n_frames: 3
+  fine_min_inliers_heading: 12
+  # Adaptive search (driven by particle spread)
+  min_search_radius_m: 40.0
+  search_radius_multiplier: 2.5
+  base_context_fraction: 0.25
+  max_context_fraction: 1.0
+
+matchers:
+  script_dir: "/media/aniel/storage/bags_jetson/vpr_dinov3/dinov2_vits_layer_test"
+  boq_engine_path: "dinov3_lora_gray_boq_l10_value_256.engine"
+  fine_engine_path: "MatchAnything/matchanything_eloftr_320.trt"
+  boq_database_path: "data/descriptors_boq/boq_descriptors.pt"
+  patch_names_path: "data/descriptors_boq/patch_names.txt"
+  gps_metadata_path: "data/patches/gps_metadata.json"
+  patches_dir: "data/patches"
+  image_size: 256
+  grayscale: true
+  matcher_resolution: 320
+  camera_fx: 190.0
+  camera_fy: 190.0
+  context_enabled: true
+  context_fraction: 0.4
+  fine_conf_threshold: 0.20
+  min_inliers_ransac: 4
+  min_inliers: 8
+
+replay:
+  mcap_path: "/media/aniel/storage/bags_jetson/095c6d2c7237fe986c6240628b6ef8dd/Day2.6_0.mcap"
+  camera_topic: "/camera/image_mono"
+  rtk_topic: "/m300/rtk/fix"
+  yaw_topic: "/m300/rtk/yaw"
+  altimeter_topic: "/altimeter/range"
+  camera_subsample: 1
+  output_csv: "results/pf_results.csv"
+  output_plot: "results/pf_trajectory.png"
