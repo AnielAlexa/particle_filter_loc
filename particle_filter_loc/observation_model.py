@@ -253,8 +253,7 @@ class ObservationModel:
         if len(mkpts0) >= self.min_inliers_ransac:
             pnp_result = self._pnp_refine_gps(mkpts0, mkpts1_patch, flat_meta)
             if pnp_result is not None:
-                lat, lon, heading_deg = pnp_result
-                inliers = len(mkpts0)
+                lat, lon, heading_deg, inliers = pnp_result
                 method = "pnp"
 
         # --- Homography fallback ---
@@ -339,6 +338,19 @@ class ObservationModel:
         if not ok or inlier_idx is None or len(inlier_idx) < self.min_inliers_ransac:
             return None
 
+        # Refine pose using inliers only
+        inlier_obj = obj_pts[inlier_idx.flatten()]
+        inlier_img = img_pts[inlier_idx.flatten()]
+        try:
+            ok2, rvec, tvec = cv2.solvePnP(
+                inlier_obj, inlier_img, K, None, rvec, tvec, True,
+                cv2.SOLVEPNP_ITERATIVE,
+            )
+        except Exception:
+            ok2 = False
+        if not ok2:
+            return None
+
         R, _ = cv2.Rodrigues(rvec)
         cam_pos = (-R.T @ tvec).flatten()
 
@@ -353,7 +365,7 @@ class ObservationModel:
         heading_rad = math.atan2(R[1, 0], R[0, 0])
         heading_deg = math.degrees(heading_rad) % 360.0
 
-        return cam_lat, cam_lon, heading_deg
+        return cam_lat, cam_lon, heading_deg, len(inlier_idx)
 
     # ------------------------------------------------------------------
     # Homography fallback

@@ -207,12 +207,11 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
             search_radius = pf.get_search_radius()
 
             if pf.phase == Phase.DISPERSED:
-                # Full DB search when dispersed
                 candidate_indices = None
             else:
                 candidate_indices = obs.get_indices_within_radius(est_e, est_n, search_radius)
                 if len(candidate_indices) < 5:
-                    candidate_indices = None  # fall back to full DB
+                    candidate_indices = obs.get_indices_within_radius(est_e, est_n, search_radius * 2.0)
 
             coarse = obs.coarse_match(frame_bgr, candidate_indices=candidate_indices,
                                        top_k=pf_config.top_k_coarse)
@@ -220,9 +219,14 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
             # Cache coarse result in visualizer
             viz.coarse_name = coarse.top_k_names[0] if coarse.top_k_names else ""
             viz.coarse_sim = coarse.top_k_sims[0] if coarse.top_k_sims else 0.0
-            if viz.coarse_name:
-                patch_path = str(obs.patches_dir / (viz.coarse_name + ".png"))
-                viz.coarse_patch = cv2.imread(patch_path)
+            viz.coarse_top_k_names = coarse.top_k_names
+            viz.coarse_top_k_sims = coarse.top_k_sims
+            viz.coarse_top_k_patches = [
+                cv2.imread(str(obs.patches_dir / (n + ".png")))
+                for n in coarse.top_k_names
+            ]
+            viz.coarse_patch = viz.coarse_top_k_patches[0] if viz.coarse_top_k_patches else None
+            viz.fine_matched_name = ""
             viz.mkpts_drone = None
             viz.mkpts_patch = None
             viz.fine_method = ""
@@ -248,6 +252,7 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
                 for cand_name in candidates_to_try:
                     fine_result = obs.fine_match(frame_bgr, cand_name, context_fraction=ctx_frac)
                     if fine_result is not None:
+                        viz.fine_matched_name = cand_name
                         break
 
                 if fine_result is not None:

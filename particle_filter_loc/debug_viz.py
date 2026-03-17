@@ -17,6 +17,8 @@ _PHASE_COLOR = {
 
 _PANEL_W = 320
 _PANEL_H = 320
+_CANDS_THUMB = 256   # thumbnail size (square)
+_CANDS_H = _CANDS_THUMB + 36  # thumbnail + text label below
 _STATUS_H = 48
 _GAP = 4
 
@@ -25,6 +27,60 @@ _COLOR_GT  = (0,   50, 220)   # red  — RTK ground truth
 _COLOR_PF  = (220, 80,  0)    # blue — particle filter estimate
 _COLOR_GT_CUR = (0, 0, 255)   # bright red for current GT dot
 _COLOR_PF_CUR = (255, 120, 0) # bright blue for current PF dot
+
+
+def _build_candidates_row(
+    names: List[str],
+    sims: List[float],
+    patches: List[Optional[np.ndarray]],
+    fine_matched_name: str = "",
+    total_w: int = _PANEL_W * 4 + _GAP * 3,
+    h: int = _CANDS_H,
+) -> np.ndarray:
+    """Horizontal row of K candidate thumbnails with rank and sim score."""
+    row = np.full((h, total_w, 3), 20, dtype=np.uint8)
+    k = len(names)
+    if k == 0:
+        _text(row, ["no coarse candidates"], x=8, y0=h // 2, color=(160, 160, 160))
+        return row
+
+    cell_w = total_w // k
+    s = _CANDS_THUMB  # 256px square thumbnails
+
+    for i, (name, sim, patch) in enumerate(zip(names, sims, patches)):
+        x0 = i * cell_w
+        x1 = x0 + cell_w - 2
+        matched = bool(name == fine_matched_name and fine_matched_name)
+
+        # 256×256 thumbnail, centered horizontally in the cell
+        cx = x0 + (cell_w - s) // 2
+        if patch is not None:
+            thumb = cv2.resize(patch, (s, s), interpolation=cv2.INTER_AREA)
+            row[0:s, cx:cx + s] = thumb
+        else:
+            cv2.rectangle(row, (cx, 0), (cx + s - 1, s - 1), (60, 60, 60), -1)
+            _text(row, ["no img"], x=cx + 4, y0=s // 2, scale=0.5, color=(140, 140, 140))
+
+        # Sim score colour
+        if sim >= 0.5:
+            sim_color = (50, 210, 50)
+        elif sim >= 0.3:
+            sim_color = (50, 210, 210)
+        else:
+            sim_color = (80, 80, 220)
+
+        # Text below thumbnail
+        label = f"#{i + 1}  {sim:.3f}"
+        short = name[-24:] if name else "—"
+        _text(row, [label], x=x0 + 4, y0=s + 14, scale=0.45, color=sim_color)
+        _text(row, [short],  x=x0 + 4, y0=s + 28, scale=0.35, color=(180, 180, 180))
+
+        # Green border for the candidate that succeeded in fine matching
+        border_color = (0, 230, 80) if matched else (70, 70, 70)
+        border_thick = 2 if matched else 1
+        cv2.rectangle(row, (x0, 0), (x1 - 1, h - 1), border_color, border_thick)
+
+    return row
 
 
 def _blank(h=_PANEL_H, w=_PANEL_W):
@@ -152,6 +208,10 @@ def build_debug_frame(
     pf_path: Optional[List[Tuple[float, float]]] = None,
     phase_path: Optional[List[Phase]] = None,
     fine_H: Optional[np.ndarray] = None,
+    coarse_top_k_names: Optional[List[str]] = None,
+    coarse_top_k_sims: Optional[List[float]] = None,
+    coarse_top_k_patches: Optional[List[Optional[np.ndarray]]] = None,
+    fine_matched_name: str = "",
 ) -> np.ndarray:
     """
     Builds a 4-panel + status-bar debug image:
@@ -190,11 +250,9 @@ def build_debug_frame(
         for pt in mkpts_patch:
             cv2.circle(p2, (int(pt[0] * sx_p), int(pt[1] * sy_p)), 3, (0, 100, 255), -1, cv2.LINE_AA)
 
-    # Project drone image corners onto patch to show perspective footprint
     if fine_H is not None:
         corners = np.float32([[0, 0], [320, 0], [320, 320], [0, 320]]).reshape(-1, 1, 2)
         proj = cv2.perspectiveTransform(corners, fine_H)
-        # fine_H maps 320×320 drone → 320×320 matcher space; scale to panel
         scale_to_panel = np.array([_PANEL_W / 320.0, _PANEL_H / 320.0])
         proj_pts = (proj.reshape(-1, 2) * scale_to_panel).astype(np.int32)
         overlay = p2.copy()
@@ -206,6 +264,7 @@ def build_debug_frame(
     _text(p2, [f"sim={coarse_sim:.3f}", short_name])
     cv2.putText(p2, "COARSE", (4, _PANEL_H - 6), cv2.FONT_HERSHEY_SIMPLEX,
                 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+
 
     # ------------------------------------------------------------------ #
     # Panel 3: particle scatter (local ENU, zoomed)
@@ -265,10 +324,21 @@ def build_debug_frame(
     )
 
     # ------------------------------------------------------------------ #
-    # Status bar
+    # Candidates row
     # ------------------------------------------------------------------ #
     n_panels = 4
     total_w = _PANEL_W * n_panels + _GAP * (n_panels - 1)
+    cands_row = _build_candidates_row(
+        names=coarse_top_k_names or [],
+        sims=coarse_top_k_sims or [],
+        patches=coarse_top_k_patches or [],
+        fine_matched_name=fine_matched_name,
+        total_w=total_w,
+    )
+
+    # ------------------------------------------------------------------ #
+    # Status bar
+    # ------------------------------------------------------------------ #
     status = np.zeros((_STATUS_H, total_w, 3), dtype=np.uint8)
     cv2.rectangle(status, (0, 0), (6, _STATUS_H), phase_color, -1)
     err_str = f"{error_m:.1f}m" if error_m >= 0 else "N/A"
@@ -285,7 +355,7 @@ def build_debug_frame(
 
     # Draw correspondence lines between drone panel and patch panel
     if mkpts_drone is not None and mkpts_patch is not None and len(mkpts_drone) > 0:
-        p2_x0 = _PANEL_W + _GAP  # x offset of patch panel in top_row
+        p2_x0 = _PANEL_W + _GAP
         n_draw = min(len(mkpts_drone), 60)
         for i in range(n_draw):
             px_d = int(mkpts_drone[i, 0] * _PANEL_W / 320)
@@ -298,7 +368,7 @@ def build_debug_frame(
             py_p = np.clip(py_p, 0, _PANEL_H - 1)
             cv2.line(top_row, (px_d, py_d), (px_p, py_p), (0, 220, 100), 1, cv2.LINE_AA)
 
-    return np.vstack([top_row, status])
+    return np.vstack([top_row, cands_row, status])
 
 
 class DebugVisualizer:
@@ -328,6 +398,10 @@ class DebugVisualizer:
         self.coarse_patch: Optional[np.ndarray] = None
         self.coarse_name: str = ""
         self.coarse_sim: float = 0.0
+        self.coarse_top_k_names: List[str] = []
+        self.coarse_top_k_sims: List[float] = []
+        self.coarse_top_k_patches: List[Optional[np.ndarray]] = []
+        self.fine_matched_name: str = ""
         self.mkpts_drone: Optional[np.ndarray] = None
         self.mkpts_patch: Optional[np.ndarray] = None
         self.fine_H: Optional[np.ndarray] = None
@@ -342,7 +416,7 @@ class DebugVisualizer:
         if show_window:
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
             total_w = _PANEL_W * 4 + _GAP * 3
-            cv2.resizeWindow(window_name, total_w, _PANEL_H + _STATUS_H)
+            cv2.resizeWindow(window_name, total_w, _PANEL_H + _CANDS_H + _GAP + _STATUS_H)
             cv2.moveWindow(window_name, 80, 80)
 
         if save_frames and save_dir:
@@ -390,6 +464,10 @@ class DebugVisualizer:
             pf_path=self._pf_path,
             phase_path=self._phase_path,
             fine_H=self.fine_H,
+            coarse_top_k_names=self.coarse_top_k_names,
+            coarse_top_k_sims=self.coarse_top_k_sims,
+            coarse_top_k_patches=self.coarse_top_k_patches,
+            fine_matched_name=self.fine_matched_name,
         )
 
         if self.show_window:

@@ -41,7 +41,7 @@ matchers:
   camera_cx: 151.1
   camera_cy: 221.9
   context_enabled: true
-  context_fraction: 0.1
+  context_fraction: 0.0
   fine_conf_threshold: 0.20
   min_inliers_ransac: 4
   min_inliers: 8

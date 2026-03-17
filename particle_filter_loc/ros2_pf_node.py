@@ -141,8 +141,10 @@ class PFGeoLocNode(rclpy.node.Node):
             candidate_indices = None
         else:
             candidate_indices = obs.get_indices_within_radius(est_e, est_n, search_radius)
+            # Expand radius up to 2× if too few patches (edge-of-coverage),
+            # but never fall back to unconstrained full-database search.
             if len(candidate_indices) < 5:
-                candidate_indices = None
+                candidate_indices = obs.get_indices_within_radius(est_e, est_n, search_radius * 2.0)
 
         coarse = obs.coarse_match(frame_bgr, candidate_indices=candidate_indices,
                                    top_k=pf_config.top_k_coarse)
@@ -151,9 +153,14 @@ class PFGeoLocNode(rclpy.node.Node):
         viz = self._viz
         viz.coarse_name = coarse.top_k_names[0] if coarse.top_k_names else ""
         viz.coarse_sim = coarse.top_k_sims[0] if coarse.top_k_sims else 0.0
-        if viz.coarse_name:
-            patch_path = str(obs.patches_dir / (viz.coarse_name + ".png"))
-            viz.coarse_patch = cv2.imread(patch_path)
+        viz.coarse_top_k_names = coarse.top_k_names
+        viz.coarse_top_k_sims = coarse.top_k_sims
+        viz.coarse_top_k_patches = [
+            cv2.imread(str(obs.patches_dir / (n + ".png")))
+            for n in coarse.top_k_names
+        ]
+        viz.coarse_patch = viz.coarse_top_k_patches[0] if viz.coarse_top_k_patches else None
+        viz.fine_matched_name = ""
         viz.mkpts_drone = None
         viz.mkpts_patch = None
         viz.fine_method = ""
@@ -180,6 +187,7 @@ class PFGeoLocNode(rclpy.node.Node):
                     pf.update_fine(fe, fn, fine_result.inliers, fine_result.heading_deg)
                     viz.fine_method = fine_result.method
                     viz.fine_inliers = fine_result.inliers
+                    viz.fine_matched_name = cand_name
                     break
 
         pf.resample_if_needed()
