@@ -237,6 +237,8 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
 
             # --- Fine match (adaptive) ---
             fine_result = None
+            viz.mkpts_drone = None
+            viz.mkpts_patch = None
             if pf.should_run_fine():
                 fine_top_k = pf.get_fine_top_k()
                 ctx_frac = pf.get_context_fraction()
@@ -254,6 +256,13 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
                     pf.update_fine(fe, fn, fine_result.inliers, fine_result.heading_deg)
                     viz.fine_method = fine_result.method
                     viz.fine_inliers = fine_result.inliers
+                    viz.mkpts_drone = fine_result.mkpts_drone
+                    viz.mkpts_patch = fine_result.mkpts_patch
+                    viz.fine_H = fine_result.H
+                else:
+                    viz.mkpts_drone = None
+                    viz.mkpts_patch = None
+                    viz.fine_H = None
 
             # Resample + transitions
             pf.resample_if_needed()

@@ -151,6 +151,7 @@ def build_debug_frame(
     gt_path: Optional[List[Tuple[float, float]]] = None,
     pf_path: Optional[List[Tuple[float, float]]] = None,
     phase_path: Optional[List[Phase]] = None,
+    fine_H: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Builds a 4-panel + status-bar debug image:
@@ -177,14 +178,30 @@ def build_debug_frame(
                 0.45, (200, 200, 200), 1, cv2.LINE_AA)
 
     # ------------------------------------------------------------------ #
-    # Panel 2: coarse patch + patch keypoints
+    # Panel 2: coarse patch + patch keypoints + projected drone footprint
     # ------------------------------------------------------------------ #
     p2 = _resize(coarse_patch)
+    patch_h_orig = coarse_patch.shape[0] if coarse_patch is not None else _PANEL_H
+    patch_w_orig = coarse_patch.shape[1] if coarse_patch is not None else _PANEL_W
+    sx_p = _PANEL_W / patch_w_orig
+    sy_p = _PANEL_H / patch_h_orig
+
     if mkpts_patch is not None and len(mkpts_patch) > 0:
-        sx = _PANEL_W / 320
-        sy = _PANEL_H / 320
         for pt in mkpts_patch:
-            cv2.circle(p2, (int(pt[0] * sx), int(pt[1] * sy)), 3, (0, 100, 255), -1, cv2.LINE_AA)
+            cv2.circle(p2, (int(pt[0] * sx_p), int(pt[1] * sy_p)), 3, (0, 100, 255), -1, cv2.LINE_AA)
+
+    # Project drone image corners onto patch to show perspective footprint
+    if fine_H is not None:
+        corners = np.float32([[0, 0], [320, 0], [320, 320], [0, 320]]).reshape(-1, 1, 2)
+        proj = cv2.perspectiveTransform(corners, fine_H)
+        # fine_H maps 320×320 drone → 320×320 matcher space; scale to panel
+        scale_to_panel = np.array([_PANEL_W / 320.0, _PANEL_H / 320.0])
+        proj_pts = (proj.reshape(-1, 2) * scale_to_panel).astype(np.int32)
+        overlay = p2.copy()
+        cv2.fillPoly(overlay, [proj_pts], (40, 160, 40))
+        cv2.addWeighted(overlay, 0.25, p2, 0.75, 0, p2)
+        cv2.polylines(p2, [proj_pts], True, (0, 255, 160), 2, cv2.LINE_AA)
+
     short_name = coarse_name[-20:] if coarse_name else "—"
     _text(p2, [f"sim={coarse_sim:.3f}", short_name])
     cv2.putText(p2, "COARSE", (4, _PANEL_H - 6), cv2.FONT_HERSHEY_SIMPLEX,
@@ -265,6 +282,22 @@ def build_debug_frame(
     # ------------------------------------------------------------------ #
     gap = np.zeros((_PANEL_H, _GAP, 3), dtype=np.uint8)
     top_row = np.hstack([p1, gap, p2, gap, p3, gap, p4])
+
+    # Draw correspondence lines between drone panel and patch panel
+    if mkpts_drone is not None and mkpts_patch is not None and len(mkpts_drone) > 0:
+        p2_x0 = _PANEL_W + _GAP  # x offset of patch panel in top_row
+        n_draw = min(len(mkpts_drone), 60)
+        for i in range(n_draw):
+            px_d = int(mkpts_drone[i, 0] * _PANEL_W / 320)
+            py_d = int(mkpts_drone[i, 1] * _PANEL_H / 320)
+            px_p = int(mkpts_patch[i, 0] * sx_p) + p2_x0
+            py_p = int(mkpts_patch[i, 1] * sy_p)
+            px_d = np.clip(px_d, 0, _PANEL_W - 1)
+            py_d = np.clip(py_d, 0, _PANEL_H - 1)
+            px_p = np.clip(px_p, p2_x0, p2_x0 + _PANEL_W - 1)
+            py_p = np.clip(py_p, 0, _PANEL_H - 1)
+            cv2.line(top_row, (px_d, py_d), (px_p, py_p), (0, 220, 100), 1, cv2.LINE_AA)
+
     return np.vstack([top_row, status])
 
 
@@ -297,6 +330,7 @@ class DebugVisualizer:
         self.coarse_sim: float = 0.0
         self.mkpts_drone: Optional[np.ndarray] = None
         self.mkpts_patch: Optional[np.ndarray] = None
+        self.fine_H: Optional[np.ndarray] = None
         self.fine_method: str = ""
         self.fine_inliers: int = 0
 
@@ -309,6 +343,7 @@ class DebugVisualizer:
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
             total_w = _PANEL_W * 4 + _GAP * 3
             cv2.resizeWindow(window_name, total_w, _PANEL_H + _STATUS_H)
+            cv2.moveWindow(window_name, 80, 80)
 
         if save_frames and save_dir:
             import os
@@ -354,6 +389,7 @@ class DebugVisualizer:
             gt_path=self._gt_path,
             pf_path=self._pf_path,
             phase_path=self._phase_path,
+            fine_H=self.fine_H,
         )
 
         if self.show_window:

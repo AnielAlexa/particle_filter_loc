@@ -31,6 +31,9 @@ class FineResult:
     method: str  # "pnp" or "homography"
     heading_deg: Optional[float]
     patch_name: str
+    mkpts_drone: Optional[np.ndarray] = None   # [M,2] keypoints in drone frame (320px)
+    mkpts_patch: Optional[np.ndarray] = None   # [M,2] keypoints in patch pixel space
+    H: Optional[np.ndarray] = None             # homography: drone(320) → patch(320) matcher space
 
 
 def _import_match_module(script_dir: str):
@@ -226,6 +229,11 @@ class ObservationModel:
         # Scale patch keypoints to composite pixel space
         mkpts1_patch = mkpts1 * np.array([[patch_w / res, patch_h / res]], dtype=np.float32)
 
+        # Homography for visualization (drone 320px → patch 320px matcher space)
+        vis_H = None
+        if len(mkpts0) >= 4:
+            vis_H, _ = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
+
         # --- PnP ---
         lat, lon, inliers, method, heading_deg = None, None, 0, "homography", None
 
@@ -258,6 +266,8 @@ class ObservationModel:
         return FineResult(
             lat=lat, lon=lon, inliers=inliers, method=method,
             heading_deg=heading_deg, patch_name=patch_name,
+            mkpts_drone=mkpts0, mkpts_patch=mkpts1_patch,
+            H=vis_H,
         )
 
     # ------------------------------------------------------------------
