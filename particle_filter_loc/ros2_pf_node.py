@@ -165,6 +165,10 @@ class PFGeoLocNode(rclpy.node.Node):
             coarse_obs.append((e, n, sim))
         pf.update_coarse(coarse_obs)
 
+        # Update observation model with current altitude before fine matching
+        if len(self._altitude_buf) > 0:
+            self.obs.altitude_m = float(np.median(self._altitude_buf))
+
         fine_result = None
         if pf.should_run_fine():
             fine_top_k = pf.get_fine_top_k()

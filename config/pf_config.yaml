@@ -36,8 +36,10 @@ matchers:
   image_size: 256
   grayscale: true
   matcher_resolution: 320
-  camera_fx: 190.0
-  camera_fy: 190.0
+  camera_fx: 501.8
+  camera_fy: 502.1
+  camera_cx: 151.1
+  camera_cy: 221.9
   context_enabled: true
   context_fraction: 0.1
   fine_conf_threshold: 0.20

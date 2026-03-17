@@ -16,6 +16,15 @@ import torch.nn.functional as F
 from .geo_utils import ENUFrame, haversine_m
 
 
+def _center_crop_square(frame: np.ndarray) -> np.ndarray:
+    h, w = frame.shape[:2]
+    if w == h:
+        return frame
+    s = min(w, h)
+    x0, y0 = (w - s) // 2, (h - s) // 2
+    return frame[y0:y0+s, x0:x0+s]
+
+
 @dataclass
 class CoarseResult:
     top_k_names: List[str]
@@ -66,6 +75,9 @@ class ObservationModel:
         self.matcher_resolution = config.get("matcher_resolution", 320)
         self.camera_fx = config.get("camera_fx", 190.0)
         self.camera_fy = config.get("camera_fy", 190.0)
+        self.camera_cx = config.get("camera_cx", self.matcher_resolution / 2.0)
+        self.camera_cy = config.get("camera_cy", self.matcher_resolution / 2.0)
+        self.altitude_m: float = 50.0   # updated continuously by ros2_pf_node each frame
         self.context_enabled = config.get("context_enabled", True)
         self.context_fraction = config.get("context_fraction", 0.4)
         self.fine_conf_threshold = config.get("fine_conf_threshold", 0.20)
@@ -197,9 +209,10 @@ class ObservationModel:
         patch_h = flat_meta["patch_h"]
         patch_w = flat_meta["patch_w"]
 
-        # Resize and convert to grayscale float
+        # Center-crop drone frame to square, then resize
+        frame_cropped = _center_crop_square(frame_bgr)
         q_gray = cv2.cvtColor(
-            cv2.resize(frame_bgr, (res, res)), cv2.COLOR_BGR2GRAY
+            cv2.resize(frame_cropped, (res, res)), cv2.COLOR_BGR2GRAY
         ).astype(np.float32) / 255.0
         p_gray = cv2.cvtColor(
             cv2.resize(patch_bgr, (res, res)), cv2.COLOR_BGR2GRAY
@@ -308,19 +321,17 @@ class ObservationModel:
         obj_pts = np.array(obj_pts, dtype=np.float32)
 
         img_pts = mkpts_drone.astype(np.float32)
-        cx = self.matcher_resolution / 2.0
-        cy = self.matcher_resolution / 2.0
-        K = np.array([[self.camera_fx, 0, cx],
-                       [0, self.camera_fy, cy],
-                       [0, 0, 1]], dtype=np.float32)
+        K = np.array([[self.camera_fx, 0,             self.camera_cx],
+                      [0,             self.camera_fy, self.camera_cy],
+                      [0,             0,              1             ]], dtype=np.float32)
 
+        tvec_init = np.array([[0.0], [0.0], [self.altitude_m]], dtype=np.float32)
         try:
             ok, rvec, tvec, inlier_idx = cv2.solvePnPRansac(
                 obj_pts, img_pts, K, None,
-                iterationsCount=100,
-                reprojectionError=8.0,
-                confidence=0.99,
-                flags=cv2.SOLVEPNP_ITERATIVE,
+                None, tvec_init, True,
+                100, 8.0, 0.99, None,
+                cv2.SOLVEPNP_ITERATIVE,
             )
         except Exception:
             return None
@@ -330,6 +341,10 @@ class ObservationModel:
 
         R, _ = cv2.Rodrigues(rvec)
         cam_pos = (-R.T @ tvec).flatten()
+
+        # Sanity check: PnP altitude must be within 50% of live altimeter reading
+        if self.altitude_m > 0.0 and abs(cam_pos[2] - self.altitude_m) > self.altitude_m * 0.5:
+            return None
 
         cam_lat = center_lat + cam_pos[1] / 111319.5
         cam_lon = center_lon + cam_pos[0] / (111319.5 * math.cos(math.radians(center_lat)))
