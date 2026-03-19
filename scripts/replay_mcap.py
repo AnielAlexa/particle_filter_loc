@@ -273,6 +273,22 @@ def run_replay(
                 print(f"  [{bag_name}|UNINIT] top1={top1_name} sim={top1_sim:.3f}  "
                       f"lock={_lock_count}/{lock_n_frames}")
 
+                # Update viz during UNINIT so the window isn't blank
+                viz.coarse_name = top1_name
+                viz.coarse_sim = top1_sim
+                viz.coarse_top_k_names = coarse.top_k_names
+                viz.coarse_top_k_sims = coarse.top_k_sims
+                viz.coarse_top_k_patches = [
+                    cv2.imread(str(obs.patches_dir / (n + ".png")))
+                    for n in coarse.top_k_names
+                ]
+                viz.coarse_patch = viz.coarse_top_k_patches[0] if viz.coarse_top_k_patches else None
+                gt_e = enu.wgs84_to_enu(gt_lat, gt_lon)[0] if gt_lat is not None else None
+                gt_n = enu.wgs84_to_enu(gt_lat, gt_lon)[1] if gt_lat is not None else None
+                elapsed_s_frame = (ts_ns - t_start) * 1e-9
+                viz.update(pf, frame_bgr, error_m=-1.0, elapsed_s=elapsed_s_frame,
+                           gt_east=gt_e, gt_north=gt_n)
+
                 if _lock_count >= lock_n_frames and len(_lock_sims) >= lock_n_frames:
                     mean_sim = float(np.mean(_lock_sims))
                     tight_sigma = pf_config.sigma_obs_coarse / np.sqrt(_lock_count)
@@ -323,6 +339,11 @@ def run_replay(
                 coarse_top_k_enu.append((e, n))
 
             pf.update_coarse(coarse_obs, altitude_m=current_altitude_m)
+
+            # Strong trust: if top-1 sim is high, teleport particles there
+            if coarse_obs:
+                top_e, top_n, top_sim = coarse_obs[0]
+                pf.inject_coarse_trust(top_e, top_n, top_sim)
 
             # --- Fine match (adaptive) ---
             fine_result = None

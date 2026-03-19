@@ -30,13 +30,29 @@ particle_filter:
   altitude_sigma_scale: 0.5
   # Fine match consistency gate (0 = disabled)
   fine_consistency_max_m: 0.0
+  # Strong coarse trust: if top-1 sim > threshold, teleport particles there
+  # Set to 0.0 to disable
+  coarse_trust_sim: 0.4
+  coarse_trust_fraction: 0.7    # fraction of particles to replace
+  coarse_trust_sigma: 20.0      # spatial spread of injected particles (m)
 
 matchers:
   script_dir: "/media/aniel/storage/bags_jetson/vpr_dinov3/dinov2_vits_layer_test"
+  # ── Coarse matcher switch ─────────────────────────────────────────────
+  use_vlad: true
+  # VLAD (timm DINOv3 + hard-assignment VLAD, no TRT required)
+  vlad_codebook_path:    "data/descriptors_vlad/vlad_codebook.pt"
+  vlad_database_path:    "data/descriptors_vlad/vlad_descriptors.pt"
+  vlad_patch_names_path: "data/descriptors_vlad/patch_names.txt"
+  vlad_num_clusters: 16
+  vlad_layer_idx: 10
+  vlad_image_size: 256
+  # BoQ TRT (set use_vlad: false to restore this path)
   boq_engine_path: "dinov3_lora_gray_boq_l10_value_256.engine"
-  fine_engine_path: "MatchAnything/matchanything_eloftr_320.trt"
   boq_database_path: "data/descriptors_boq/boq_descriptors.pt"
   patch_names_path: "data/descriptors_boq/patch_names.txt"
+  # ─────────────────────────────────────────────────────────────────────
+  fine_engine_path: "MatchAnything/matchanything_eloftr_320.trt"
   gps_metadata_path: "data/patches/gps_metadata.json"
   patches_dir: "data/patches"
   image_size: 256
@@ -54,7 +70,7 @@ matchers:
 
 init:
   lock_n_frames: 4          # consecutive top-1 hits before seeding
-  lock_sim_threshold: 0.40  # minimum sim to count as a hit
+  lock_sim_threshold: 0.3  # minimum sim to count as a hit
 
 replay:
   mcap_path: "/media/aniel/storage/bags_jetson/095c6d2c7237fe986c6240628b6ef8dd/Day2.6_0.mcap"

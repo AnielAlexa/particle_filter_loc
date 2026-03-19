@@ -47,6 +47,11 @@ class PFConfig:
     # Prevents visually-ambiguous patches from jumping the PF across the map.
     # Set to 0.0 to disable (always accept fine).
     fine_consistency_max_m: float = 0.0
+    # Strong coarse trust: when top-1 sim exceeds this threshold, teleport most
+    # particles to the matched patch center.  Set to 0.0 to disable.
+    coarse_trust_sim: float = 0.0
+    coarse_trust_fraction: float = 0.7   # fraction of particles to inject
+    coarse_trust_sigma: float = 20.0     # spatial spread of injected particles (m)
 
 
 class ParticleFilter:
@@ -184,6 +189,39 @@ class ParticleFilter:
             self.weights /= total
         else:
             self.weights = np.full(N, 1.0 / N)
+
+    def inject_coarse_trust(self, east: float, north: float, sim: float):
+        """If sim exceeds threshold, teleport most particles to (east, north).
+
+        Replaces `coarse_trust_fraction` of particles with fresh samples
+        drawn from a tight Gaussian around the match, keeping the rest
+        for diversity.  Weights are reset to uniform.
+        """
+        if self.particles is None:
+            return
+        if self.cfg.coarse_trust_sim <= 0.0 or sim < self.cfg.coarse_trust_sim:
+            return
+
+        n = len(self.particles)
+        n_inject = int(self.cfg.coarse_trust_fraction * n)
+        n_keep = n - n_inject
+
+        # Keep the highest-weight existing particles
+        keep_idx = np.argsort(self.weights)[-n_keep:]
+
+        # Preserve current heading estimate for injected particles
+        est_hdg = float(np.average(self.particles[:, 2], weights=self.weights))
+
+        sigma = self.cfg.coarse_trust_sigma
+        new_e = self.rng.normal(east, sigma, n_inject)
+        new_n = self.rng.normal(north, sigma, n_inject)
+        new_h = self.rng.normal(est_hdg, 10.0, n_inject) % 360.0
+
+        self.particles = np.vstack([
+            self.particles[keep_idx],
+            np.column_stack([new_e, new_n, new_h]),
+        ])
+        self.weights = np.full(n, 1.0 / n)
 
     def update_fine(self, fine_east: float, fine_north: float, inliers: int,
                     heading_deg: Optional[float] = None) -> bool:

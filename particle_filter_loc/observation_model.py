@@ -86,9 +86,27 @@ class ObservationModel:
         self.image_size = config.get("image_size", 256)
         self.grayscale = config.get("grayscale", True)
 
-        # Load database
-        db_path = script_dir / config["boq_database_path"]
-        print(f"Loading BoQ descriptors from {db_path} ...")
+        # ── Coarse matcher: VLAD or BoQ TRT ──────────────────────────────
+        use_vlad = config.get("use_vlad", False)
+
+        if use_vlad:
+            from .vlad_extractor import DINOv3VLADExtractor
+            codebook_path = script_dir / config["vlad_codebook_path"]
+            self.extractor = DINOv3VLADExtractor(
+                codebook_path=str(codebook_path),
+                layer_idx=config.get("vlad_layer_idx", 10),
+                image_size=self.image_size,
+                grayscale=self.grayscale,
+                device="cuda",
+            )
+            db_path = script_dir / config["vlad_database_path"]
+            names_path = script_dir / config["vlad_patch_names_path"]
+        else:
+            db_path = script_dir / config["boq_database_path"]
+            names_path = script_dir / config["patch_names_path"]
+
+        # Load descriptor database
+        print(f"Loading {'VLAD' if use_vlad else 'BoQ'} descriptors from {db_path} …")
         data = torch.load(str(db_path), map_location="cuda")
         if isinstance(data, dict):
             self.db_descriptors = data.get("descriptors", data.get("boq_descriptors", list(data.values())[0]))
@@ -98,7 +116,6 @@ class ObservationModel:
         self.n_patches = self.db_descriptors.shape[0]
 
         # Patch names
-        names_path = script_dir / config["patch_names_path"]
         with open(str(names_path)) as f:
             self.patch_names = [l.strip() for l in f if l.strip()]
         assert len(self.patch_names) == self.n_patches
@@ -131,17 +148,20 @@ class ObservationModel:
                 self._patch_enu.append((0.0, 0.0))
         self._patch_enu_np = np.array(self._patch_enu, dtype=np.float64)  # [N_patches, 2]
 
-        # Load TRT engines
+        # ── Load match module (needed for fine matcher and optional BoQ) ─
         mod = _import_match_module(config["script_dir"])
 
-        boq_path = script_dir / config["boq_engine_path"]
-        print(f"Loading coarse BoQ engine: {boq_path}")
-        self.extractor = mod.DINOv3LoRABoQExtractorTRT(
-            engine_path=str(boq_path),
-            image_size=self.image_size,
-            grayscale=self.grayscale,
-        )
+        # ── Coarse matcher: BoQ TRT (only when not using VLAD) ──────────
+        if not use_vlad:
+            boq_path = script_dir / config["boq_engine_path"]
+            print(f"Loading coarse BoQ engine: {boq_path}")
+            self.extractor = mod.DINOv3LoRABoQExtractorTRT(
+                engine_path=str(boq_path),
+                image_size=self.image_size,
+                grayscale=self.grayscale,
+            )
 
+        # ── Fine matcher (TRT, always loaded) ───────────────────────────
         fine_path = script_dir / config["fine_engine_path"]
         print(f"Loading fine matcher engine: {fine_path}")
         self.matcher = mod.TRTWrapper(str(fine_path))
