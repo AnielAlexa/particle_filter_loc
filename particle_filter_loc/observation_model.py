@@ -356,7 +356,7 @@ class ObservationModel:
         # Un-rotate keypoints back to North-up mosaic space
         # Inverse of rotation by +heading around center = rotation by -heading
         cx, cy = rotation_center_px
-        angle_rad = math.radians(-(heading_deg_rot + 90.0))  # undo the rotation (+90 camera mount offset)
+        angle_rad = math.radians(-heading_deg_rot)  # undo the rotation
         cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
         dx = mkpts1_rot[:, 0] - cx
         dy = mkpts1_rot[:, 1] - cy

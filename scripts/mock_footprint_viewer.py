@@ -51,6 +51,7 @@ def run_viewer(config_path: str, show: bool = True, save_frames: bool = False,
     orig_fy = cfg.get("camera_original", {}).get("fy", 1130.0)
     orig_w = cfg.get("camera_original", {}).get("w", 1280)
     orig_h = cfg.get("camera_original", {}).get("h", 720)
+    heading_offset_deg = cfg.get("camera_original", {}).get("heading_offset_deg", 0.0)
 
     # Load satellite metadata and reconstructor
     script_dir = Path(mcfg["script_dir"])
@@ -126,7 +127,7 @@ def run_viewer(config_path: str, show: bool = True, save_frames: bool = False,
 
         # --- Yaw ---
         if topic == yaw_topic:
-            current_yaw_deg = float(decoded_msg.data)
+            current_yaw_deg = float(decoded_msg.data) * 10.0
             continue
 
         # --- RTK ---
@@ -166,7 +167,7 @@ def run_viewer(config_path: str, show: bool = True, save_frames: bool = False,
             # Reconstruct satellite footprint
             result = reconstructor.reconstruct(
                 current_lat, current_lon,
-                current_altitude_m, current_yaw_deg,
+                current_altitude_m, current_yaw_deg + heading_offset_deg,
                 orig_fx, orig_fy, orig_w, orig_h,
                 output_size=(panel_h, panel_w),
             )

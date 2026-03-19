@@ -3,6 +3,7 @@ camera_original:
   fy: 1130.0
   w: 1280
   h: 720
+  heading_offset_deg: 270   # camera mount offset added to yaw for satellite alignment
 
 enu_origin:
   lat: 45.7896
@@ -23,7 +24,7 @@ particle_filter:
   converge_spread_m: 60.0        # tuned: grid search best
   tracking_spread_m: 30.0        # tuned: grid search best (30 > 20, easier TRACKING entry)
   lost_spread_m: 150.0
-  fine_every_n_frames: 2         # tuned: grid search best (more frequent fine updates)
+  fine_every_n_frames: 1        # tuned: grid search best (more frequent fine updates)
   fine_min_inliers_heading: 12
   # Adaptive search (driven by particle spread)
   min_search_radius_m: 40.0

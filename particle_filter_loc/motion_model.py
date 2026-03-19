@@ -42,8 +42,9 @@ class RTKMotionModel(MotionModelBase):
         self._prev_ts: Optional[int] = None
         self._yaw_deg: float = 0.0
 
-    def set_yaw(self, yaw_deg: float):
-        self._yaw_deg = yaw_deg
+    def set_yaw(self, yaw_raw: float):
+        """Set yaw from RTK topic. Raw values are in tens of degrees (×10)."""
+        self._yaw_deg = yaw_raw * 10.0
 
     def update(self, timestamp_ns: int, lat: float = 0.0, lon: float = 0.0, **kwargs) -> Optional[MotionDelta]:
         if self._prev_lat is None:

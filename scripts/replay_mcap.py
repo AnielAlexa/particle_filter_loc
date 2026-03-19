@@ -48,6 +48,7 @@ def run_replay(
     max_frames: Optional[int] = None, # stop after this many camera frames (debug)
     bag_name: Optional[str] = None,   # override bag name for output dirs
     rtk_init: bool = True,            # seed PF from first RTK fix (skip coarse-lock)
+    rtk_noise_m: float = 0.0,         # add Gaussian noise to RTK deltas (sigma in meters)
 ) -> dict:
     """Run replay and return summary metrics dict.
 
@@ -125,6 +126,7 @@ def run_replay(
     cam_fy = cam_orig.get("fy", 1130.0)
     cam_w  = cam_orig.get("w", 1280)
     cam_h  = cam_orig.get("h", 720)
+    heading_offset_deg = cam_orig.get("heading_offset_deg", 0.0)
 
     # Debug visualizer
     debug_frames_dir = str(output_csv.parent / "debug_frames") if save_frames else None
@@ -163,6 +165,8 @@ def run_replay(
     _pending_rtk_deltas = []          # RTK deltas since last camera frame
 
     print(f"[{bag_name}] Opening MCAP: {mcap_path}")
+    if rtk_noise_m > 0.0:
+        print(f"[{bag_name}] RTK noise injected: sigma={rtk_noise_m:.1f}m  heading_sigma={rtk_noise_m*2:.1f}deg")
     print(f"[{bag_name}] Altitude gating: process frames >= {altitude_min_m:.0f}m")
 
     from mcap.reader import make_reader
@@ -222,6 +226,14 @@ def run_replay(
             if initialized and pf.phase != Phase.UNINIT:
                 delta = motion.update(ts_ns, lat=lat, lon=lon)
                 if delta is not None:
+                    # Inject noise to simulate GPS degradation
+                    if rtk_noise_m > 0.0:
+                        delta = MotionDelta(
+                            dx_m=delta.dx_m + np.random.normal(0, rtk_noise_m),
+                            dy_m=delta.dy_m + np.random.normal(0, rtk_noise_m),
+                            heading_deg=delta.heading_deg + np.random.normal(0, rtk_noise_m * 2.0),
+                            dt_s=delta.dt_s,
+                        )
                     pf.predict(delta)
                     _pending_rtk_deltas.append({
                         "dx_m": delta.dx_m,
@@ -370,7 +382,8 @@ def run_replay(
             fp_recon = None
             if est_lat_prev is not None:
                 fp_recon = reconstructor.reconstruct(
-                    est_lat_prev, est_lon_prev, current_altitude_m, est_hdg_prev,
+                    est_lat_prev, est_lon_prev, current_altitude_m,
+                    est_hdg_prev + heading_offset_deg,
                     cam_fx, cam_fy, cam_w, cam_h,
                     output_size=(320, 320),
                 )
@@ -915,6 +928,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-rtk-init", dest="rtk_init", action="store_false",
                         help="Disable RTK init (use coarse-lock instead)")
     parser.set_defaults(rtk_init=True)
+    parser.add_argument("--rtk-noise", type=float, default=0.0,
+                        help="Add Gaussian noise to RTK deltas (sigma in meters, 0=off)")
     args = parser.parse_args()
     run_replay(
         args.config,
@@ -925,4 +940,5 @@ if __name__ == "__main__":
         altitude_min_override=args.altitude_min,
         max_frames=args.max_frames,
         rtk_init=args.rtk_init,
+        rtk_noise_m=args.rtk_noise,
     )

@@ -97,9 +97,8 @@ class SatelliteFootprintReconstructor:
             output_size: (height, width) of output image.
         """
         # 1. Compute footprint corners in GPS
-        #    +90° offset: camera mounted with image-up = body-left
         corners_gps = compute_footprint_corners_gps(
-            fx, fy, img_w, img_h, altitude_m, heading_deg + 90.0,
+            fx, fy, img_w, img_h, altitude_m, heading_deg,
             lat, lon, self.enu,
         )
 
@@ -159,7 +158,7 @@ class SatelliteFootprintReconstructor:
         center_px_x = (lon - m_min_lon) / (m_max_lon - m_min_lon) * (m_w - 1)
         center_px_y = (m_max_lat - lat) / (m_max_lat - m_min_lat) * (m_h - 1)
         rot_mat = cv2.getRotationMatrix2D(
-            (float(center_px_x), float(center_px_y)), heading_deg + 90.0, 1.0,
+            (float(center_px_x), float(center_px_y)), heading_deg, 1.0,
         )
         mosaic_rot = cv2.warpAffine(
             mosaic, rot_mat, (m_w, m_h),
