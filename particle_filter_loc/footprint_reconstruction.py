@@ -23,6 +23,7 @@ class FootprintReconstruction:
     mosaic_rotated: Optional[np.ndarray] = None    # mosaic rotated to drone orientation
     rotation_center_px: Optional[Tuple[float, float]] = None  # (cx, cy) in North-up mosaic
     heading_deg: float = 0.0                       # heading used for rotation
+    warp_M_inv: Optional[np.ndarray] = None        # inverse perspective: satellite_crop px → mosaic px
 
 
 class SatelliteFootprintReconstructor:
@@ -144,6 +145,7 @@ class SatelliteFootprintReconstructor:
         ], dtype=np.float32)
 
         M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        M_inv = cv2.getPerspectiveTransform(dst_pts, src_pts)
         warped = cv2.warpPerspective(
             mosaic, M, (out_w, out_h),
             flags=cv2.INTER_LINEAR,
@@ -177,6 +179,7 @@ class SatelliteFootprintReconstructor:
             mosaic_rotated=mosaic_rot,
             rotation_center_px=(float(center_px_x), float(center_px_y)),
             heading_deg=heading_deg,
+            warp_M_inv=M_inv,
         )
 
     def _stitch_mosaic(

@@ -421,6 +421,114 @@ class ObservationModel:
             H=vis_H,
         )
 
+    def fine_match_on_satellite(
+        self,
+        frame_bgr: np.ndarray,
+        satellite_crop: np.ndarray,
+        mosaic_meta: dict,
+        warp_M_inv: np.ndarray,
+    ) -> Optional[FineResult]:
+        """Fine match drone frame against the perspective-warped satellite crop.
+
+        The satellite_crop is already aligned to the drone FOV orientation.
+        warp_M_inv maps satellite_crop pixel coords back to North-up mosaic
+        pixel coords for GPS conversion.
+        """
+        res = self.matcher_resolution
+        sh, sw = satellite_crop.shape[:2]
+
+        frame_cropped = _center_crop_square(frame_bgr)
+        q_gray = cv2.cvtColor(
+            cv2.resize(frame_cropped, (res, res)), cv2.COLOR_BGR2GRAY
+        ).astype(np.float32) / 255.0
+        p_gray = cv2.cvtColor(
+            cv2.resize(satellite_crop, (res, res)), cv2.COLOR_BGR2GRAY
+        ).astype(np.float32) / 255.0
+        q_np = q_gray[np.newaxis, np.newaxis]
+        p_np = p_gray[np.newaxis, np.newaxis]
+
+        try:
+            out = self.matcher.infer(q_np, p_np)
+        except Exception:
+            return None
+
+        mkpts0 = out.get("keypoints0")
+        mkpts1 = out.get("keypoints1")
+        mconf = out.get("mconf")
+
+        if mkpts0 is None or mkpts1 is None or mconf is None or len(mconf) == 0:
+            return None
+
+        mask = mconf > self.fine_conf_threshold
+        if mask.sum() < self.min_inliers_ransac:
+            return None
+
+        mkpts0 = mkpts0[mask]
+        mkpts1 = mkpts1[mask]
+
+        # Scale keypoints from matcher res to satellite_crop pixel space
+        mkpts1_sat = mkpts1 * np.array([[sw / res, sh / res]], dtype=np.float32)
+
+        # Un-warp: satellite_crop pixels → North-up mosaic pixels via M_inv
+        pts_h = np.hstack([mkpts1_sat, np.ones((len(mkpts1_sat), 1), dtype=np.float32)])
+        mosaic_pts_h = (warp_M_inv @ pts_h.T).T  # [N, 3]
+        mosaic_pts = mosaic_pts_h[:, :2] / mosaic_pts_h[:, 2:3]  # dehomogenize
+        mkpts1_northup = mosaic_pts.astype(np.float32)
+
+        mh = mosaic_meta["h"]
+        mw = mosaic_meta["w"]
+        flat_meta = {
+            "min_lat": mosaic_meta["min_lat"],
+            "max_lat": mosaic_meta["max_lat"],
+            "min_lon": mosaic_meta["min_lon"],
+            "max_lon": mosaic_meta["max_lon"],
+            "patch_h": mh,
+            "patch_w": mw,
+        }
+
+        vis_H = None
+        if len(mkpts0) >= 4:
+            vis_H, _ = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
+
+        lat, lon, inliers, method, heading_deg = None, None, 0, "homography", None
+
+        if len(mkpts0) >= self.min_inliers_ransac:
+            pnp_result = self._pnp_refine_gps(mkpts0, mkpts1_northup, flat_meta)
+            if pnp_result is not None:
+                lat, lon, heading_deg, inliers = pnp_result
+                method = "pnp"
+
+        if lat is None:
+            if len(mkpts0) < 4:
+                return None
+            H_northup, hm = cv2.findHomography(
+                mkpts0 * np.array([[mw / res, mh / res]], dtype=np.float32),
+                mkpts1_northup, cv2.RANSAC, 5.0,
+            )
+            if H_northup is None:
+                return None
+            inliers = int(hm.sum())
+            if inliers < self.min_inliers_ransac:
+                return None
+            cx_d, cy_d = mw / 2.0, mh / 2.0
+            pt = np.array([[[cx_d, cy_d]]], dtype=np.float32)
+            pt_res = cv2.perspectiveTransform(pt, H_northup)[0][0]
+            px = max(0.0, min(float(mw - 1), float(pt_res[0])))
+            py = max(0.0, min(float(mh - 1), float(pt_res[1])))
+            lat = flat_meta["max_lat"] - py * (flat_meta["max_lat"] - flat_meta["min_lat"]) / (mh - 1)
+            lon = flat_meta["min_lon"] + px * (flat_meta["max_lon"] - flat_meta["min_lon"]) / (mw - 1)
+            method = "homography"
+
+        if inliers < self.min_inliers:
+            return None
+
+        return FineResult(
+            lat=lat, lon=lon, inliers=inliers, method=method,
+            heading_deg=heading_deg, patch_name="satellite",
+            mkpts_drone=mkpts0, mkpts_patch=mkpts1_sat,
+            H=vis_H,
+        )
+
     # ------------------------------------------------------------------
     # PnP refinement with heading extraction
     # ------------------------------------------------------------------

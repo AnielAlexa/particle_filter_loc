@@ -348,10 +348,7 @@ def run_replay(
             ]
             viz.coarse_patch = viz.coarse_top_k_patches[0] if viz.coarse_top_k_patches else None
             viz.fine_matched_name = ""
-            viz.mkpts_drone = None
-            viz.mkpts_patch = None
-            viz.fine_method = ""
-            viz.fine_inliers = 0
+            viz.clear_fine()
 
             # Build coarse obs with ENU centers
             coarse_obs = []
@@ -369,43 +366,101 @@ def run_replay(
                 top_e, top_n, top_sim = coarse_obs[0]
                 pf.inject_coarse_trust(top_e, top_n, top_sim)
 
+            # --- Reconstruct satellite mosaic (single call for fine matching + viz) ---
+            fp_recon = None
+            if est_lat_prev is not None:
+                fp_recon = reconstructor.reconstruct(
+                    est_lat_prev, est_lon_prev, current_altitude_m, est_hdg_prev,
+                    cam_fx, cam_fy, cam_w, cam_h,
+                    output_size=(320, 320),
+                )
+
+            # Satellite footprint viz (from same reconstruction)
+            top1_sim = coarse.top_k_sims[0] if coarse.top_k_sims else 0.0
+            if fp_recon is not None:
+                viz.satellite_footprint = fp_recon.satellite_crop
+                viz.footprint_confidence = top1_sim
+                viz.footprint_info_str = (
+                    f"{fp_recon.footprint_w_m:.0f}x{fp_recon.footprint_h_m:.0f}m "
+                    f"sim={top1_sim:.2f}"
+                )
+            else:
+                viz.satellite_footprint = None
+
             # --- Fine match (adaptive) ---
             fine_result = None
-            viz.mkpts_drone = None
-            viz.mkpts_patch = None
+            sat_fine = None
+            mosaic_fine = None
+            patch_fine = None
             if pf.should_run_fine():
                 fine_attempted += 1
-                fine_candidates = []  # (result, source_label) pairs
 
-                # A) Fine match on heading-rotated satellite mosaic (PF estimate)
-                if est_lat_prev is not None:
-                    fp_for_fine = reconstructor.reconstruct(
-                        est_lat_prev, est_lon_prev, current_altitude_m, est_hdg_prev,
-                        cam_fx, cam_fy, cam_w, cam_h,
-                        output_size=(320, 320),
+                # A) Fine match on satellite crop (perspective-warped to drone FOV)
+                if (fp_recon is not None and fp_recon.warp_M_inv is not None):
+                    sat_fine = obs.fine_match_on_satellite(
+                        frame_bgr,
+                        fp_recon.satellite_crop,
+                        fp_recon.mosaic_meta,
+                        fp_recon.warp_M_inv,
                     )
-                    if (fp_for_fine is not None and
-                            fp_for_fine.mosaic_rotated is not None and
-                            fp_for_fine.rotation_center_px is not None):
-                        mosaic_fine = obs.fine_match_on_mosaic(
-                            frame_bgr,
-                            fp_for_fine.mosaic_rotated,
-                            fp_for_fine.mosaic_meta,
-                            fp_for_fine.rotation_center_px,
-                            fp_for_fine.heading_deg,
-                        )
-                        if mosaic_fine is not None:
-                            fine_candidates.append((mosaic_fine, "mosaic"))
 
-                # B) Fine match on coarse top-1 patch
+                # B) Fine match on heading-rotated mosaic
+                if (fp_recon is not None and
+                        fp_recon.mosaic_rotated is not None and
+                        fp_recon.rotation_center_px is not None):
+                    mosaic_fine = obs.fine_match_on_mosaic(
+                        frame_bgr,
+                        fp_recon.mosaic_rotated,
+                        fp_recon.mosaic_meta,
+                        fp_recon.rotation_center_px,
+                        fp_recon.heading_deg,
+                    )
+
+                # C) Fine match on coarse top-1 patch
                 if coarse.top_k_names:
                     ctx_frac = pf.get_context_fraction()
                     patch_fine = obs.fine_match(frame_bgr, coarse.top_k_names[0],
                                                context_fraction=ctx_frac)
-                    if patch_fine is not None:
-                        fine_candidates.append((patch_fine, coarse.top_k_names[0]))
 
-                # Pick the one with more inliers
+                # Store results for visualization
+                # Mosaic panel shows best of satellite/mosaic
+                best_mosaic = None
+                if sat_fine is not None and mosaic_fine is not None:
+                    best_mosaic = sat_fine if sat_fine.inliers >= mosaic_fine.inliers else mosaic_fine
+                elif sat_fine is not None:
+                    best_mosaic = sat_fine
+                elif mosaic_fine is not None:
+                    best_mosaic = mosaic_fine
+
+                if best_mosaic is not None and fp_recon is not None:
+                    # Show satellite crop in viz if satellite won, else rotated mosaic
+                    if best_mosaic.patch_name == "satellite":
+                        viz.mosaic_ref_img = fp_recon.satellite_crop
+                    else:
+                        viz.mosaic_ref_img = fp_recon.mosaic_rotated
+                    viz.mosaic_mkpts_drone = best_mosaic.mkpts_drone
+                    viz.mosaic_mkpts_ref = best_mosaic.mkpts_patch
+                    viz.mosaic_fine_method = f"{best_mosaic.method}({best_mosaic.patch_name})"
+                    viz.mosaic_fine_inliers = best_mosaic.inliers
+
+                if patch_fine is not None:
+                    top1_ctx = obs._build_context_patch(coarse.top_k_names[0],
+                                                        pf.get_context_fraction())
+                    viz.top1_mkpts_drone = patch_fine.mkpts_drone
+                    viz.top1_mkpts_ref = patch_fine.mkpts_patch
+                    viz.top1_ref_img = top1_ctx[0] if top1_ctx is not None else viz.coarse_patch
+                    viz.top1_fine_method = patch_fine.method
+                    viz.top1_fine_inliers = patch_fine.inliers
+
+                # Pick the best across all three for PF update
+                fine_candidates = []
+                if sat_fine is not None:
+                    fine_candidates.append((sat_fine, "satellite"))
+                if mosaic_fine is not None:
+                    fine_candidates.append((mosaic_fine, "mosaic"))
+                if patch_fine is not None:
+                    fine_candidates.append((patch_fine, coarse.top_k_names[0]))
+
                 if fine_candidates:
                     fine_result, fine_source = max(fine_candidates, key=lambda x: x[0].inliers)
                     viz.fine_matched_name = fine_source
@@ -415,21 +470,9 @@ def run_replay(
                     accepted = pf.update_fine(fe, fn, fine_result.inliers, fine_result.heading_deg)
                     if accepted:
                         fine_succeeded += 1
-                        viz.fine_method = f"{fine_result.method}({fine_source})"
-                        viz.fine_inliers = fine_result.inliers
-                        viz.mkpts_drone = fine_result.mkpts_drone
-                        viz.mkpts_patch = fine_result.mkpts_patch
-                        viz.fine_H = fine_result.H
+                        viz.footprint_confidence = min(1.0, top1_sim + 0.1 * fine_result.inliers / 20.0)
                     else:
-                        viz.fine_method = f"REJECTED ({fine_result.method})"
-                        viz.fine_inliers = fine_result.inliers
-                        viz.mkpts_drone = None
-                        viz.mkpts_patch = None
-                        viz.fine_H = None
-                else:
-                    viz.mkpts_drone = None
-                    viz.mkpts_patch = None
-                    viz.fine_H = None
+                        viz.fine_matched_name = "REJECTED"
 
             # Resample + transitions
             pf.resample_if_needed()
@@ -450,26 +493,6 @@ def run_replay(
 
             t_frame_ms = (time.monotonic() - t_frame_start) * 1000
             elapsed_s_frame = (ts_ns - t_start) * 1e-9
-
-            # Satellite footprint from PF estimate
-            top1_sim = coarse.top_k_sims[0] if coarse.top_k_sims else 0.0
-            fp_confidence = top1_sim
-            if fine_result is not None:
-                fp_confidence = min(1.0, top1_sim + 0.1 * fine_result.inliers / 20.0)
-            fp_result = reconstructor.reconstruct(
-                est_lat, est_lon, current_altitude_m, est_hdg,
-                cam_fx, cam_fy, cam_w, cam_h,
-                output_size=(320, 320),
-            )
-            if fp_result is not None:
-                viz.satellite_footprint = fp_result.satellite_crop
-                viz.footprint_confidence = fp_confidence
-                viz.footprint_info_str = (
-                    f"{fp_result.footprint_w_m:.0f}x{fp_result.footprint_h_m:.0f}m "
-                    f"sim={top1_sim:.2f}"
-                )
-            else:
-                viz.satellite_footprint = None
 
             # Debug visualization
             gt_e = enu.wgs84_to_enu(gt_lat, gt_lon)[0] if gt_lat is not None else None
