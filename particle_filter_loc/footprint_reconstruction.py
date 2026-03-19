@@ -18,6 +18,11 @@ class FootprintReconstruction:
     footprint_w_m: float
     footprint_h_m: float
     source_tiles: List[str] = field(default_factory=list)
+    mosaic_bgr: Optional[np.ndarray] = None       # raw North-up stitched mosaic
+    mosaic_meta: Optional[dict] = None             # {min_lat, max_lat, min_lon, max_lon, h, w}
+    mosaic_rotated: Optional[np.ndarray] = None    # mosaic rotated to drone orientation
+    rotation_center_px: Optional[Tuple[float, float]] = None  # (cx, cy) in North-up mosaic
+    heading_deg: float = 0.0                       # heading used for rotation
 
 
 class SatelliteFootprintReconstructor:
@@ -91,8 +96,9 @@ class SatelliteFootprintReconstructor:
             output_size: (height, width) of output image.
         """
         # 1. Compute footprint corners in GPS
+        #    +90° offset: camera mounted with image-up = body-left
         corners_gps = compute_footprint_corners_gps(
-            fx, fy, img_w, img_h, altitude_m, heading_deg,
+            fx, fy, img_w, img_h, altitude_m, heading_deg + 90.0,
             lat, lon, self.enu,
         )
 
@@ -145,12 +151,32 @@ class SatelliteFootprintReconstructor:
             borderValue=(0, 0, 0),
         )
 
+        # 6. Rotate mosaic to drone orientation for fine matching
+        #    Drone image "up" = forward = heading direction.
+        #    Mosaic is North-up. Rotate mosaic by -heading so its "up" = heading.
+        center_px_x = (lon - m_min_lon) / (m_max_lon - m_min_lon) * (m_w - 1)
+        center_px_y = (m_max_lat - lat) / (m_max_lat - m_min_lat) * (m_h - 1)
+        rot_mat = cv2.getRotationMatrix2D(
+            (float(center_px_x), float(center_px_y)), heading_deg + 90.0, 1.0,
+        )
+        mosaic_rot = cv2.warpAffine(
+            mosaic, rot_mat, (m_w, m_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
+
         return FootprintReconstruction(
             satellite_crop=warped,
             footprint_corners_gps=corners_gps,
             footprint_w_m=footprint_w_m,
             footprint_h_m=footprint_h_m,
             source_tiles=source_tiles,
+            mosaic_bgr=mosaic,
+            mosaic_meta=mosaic_meta,
+            mosaic_rotated=mosaic_rot,
+            rotation_center_px=(float(center_px_x), float(center_px_y)),
+            heading_deg=heading_deg,
         )
 
     def _stitch_mosaic(

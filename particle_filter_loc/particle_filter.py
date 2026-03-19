@@ -106,6 +106,18 @@ class ParticleFilter:
         self.phase = Phase.DISPERSED
         self._frame_count = 0
 
+    def seed_from_position(self, east: float, north: float, heading_deg: float = 0.0,
+                           sigma_pos: float = 5.0, sigma_hdg: float = 10.0):
+        """Seed particles tightly around a known position (e.g. RTK fix)."""
+        n = self.cfg.n_dispersed
+        e = self.rng.normal(east, sigma_pos, size=n)
+        nn = self.rng.normal(north, sigma_pos, size=n)
+        h = self.rng.normal(heading_deg, sigma_hdg, size=n) % 360.0
+        self.particles = np.column_stack([e, nn, h])
+        self.weights = np.full(n, 1.0 / n)
+        self.phase = Phase.CONVERGING
+        self._frame_count = 0
+
     # ------------------------------------------------------------------
     # Prediction
     # ------------------------------------------------------------------

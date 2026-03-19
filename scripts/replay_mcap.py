@@ -26,6 +26,7 @@ from particle_filter_loc.motion_model import RTKMotionModel, MotionDelta
 from particle_filter_loc.particle_filter import PFConfig, ParticleFilter, Phase
 from particle_filter_loc.observation_model import ObservationModel
 from particle_filter_loc.debug_viz import DebugVisualizer
+from particle_filter_loc.footprint_reconstruction import SatelliteFootprintReconstructor
 
 
 def load_config(config_path: str) -> dict:
@@ -46,6 +47,7 @@ def run_replay(
     altitude_min_override: Optional[float] = None,
     max_frames: Optional[int] = None, # stop after this many camera frames (debug)
     bag_name: Optional[str] = None,   # override bag name for output dirs
+    rtk_init: bool = True,            # seed PF from first RTK fix (skip coarse-lock)
 ) -> dict:
     """Run replay and return summary metrics dict.
 
@@ -114,6 +116,16 @@ def run_replay(
     matchers_cfg = cfg["matchers"]
     obs = ObservationModel(matchers_cfg, enu)
 
+    # Satellite footprint reconstructor
+    reconstructor = SatelliteFootprintReconstructor(
+        obs.gps_metadata, obs.patches_dir, enu,
+    )
+    cam_orig = cfg.get("camera_original", {})
+    cam_fx = cam_orig.get("fx", 1129.0)
+    cam_fy = cam_orig.get("fy", 1130.0)
+    cam_w  = cam_orig.get("w", 1280)
+    cam_h  = cam_orig.get("h", 720)
+
     # Debug visualizer
     debug_frames_dir = str(output_csv.parent / "debug_frames") if save_frames else None
     viz = DebugVisualizer(
@@ -137,6 +149,9 @@ def run_replay(
     tracking_start_ts = None
     fine_attempted = 0
     fine_succeeded = 0
+
+    # Previous PF estimate (for mosaic fine matching)
+    est_lat_prev, est_lon_prev, est_hdg_prev = None, None, 0.0
 
     # Pre-seed coarse-lock state
     _lock_patch: str = ""
@@ -195,6 +210,14 @@ def run_replay(
             lat = decoded_msg.latitude
             lon = decoded_msg.longitude
             gt_lat, gt_lon = lat, lon
+
+            # RTK-init: seed PF directly from first RTK fix once altitude is sufficient
+            if rtk_init and initialized and pf.phase == Phase.UNINIT:
+                rtk_e, rtk_n = enu.wgs84_to_enu(lat, lon)
+                pf.seed_from_position(rtk_e, rtk_n, heading_deg=motion._yaw_deg,
+                                      sigma_pos=5.0, sigma_hdg=10.0)
+                print(f"  [{bag_name}] RTK-init: seeded PF at ({lat:.6f}, {lon:.6f})  "
+                      f"alt={current_altitude_m:.1f}m  hdg={motion._yaw_deg:.0f}")
 
             if initialized and pf.phase != Phase.UNINIT:
                 delta = motion.update(ts_ns, lat=lat, lon=lon)
@@ -341,7 +364,8 @@ def run_replay(
             pf.update_coarse(coarse_obs, altitude_m=current_altitude_m)
 
             # Strong trust: if top-1 sim is high, teleport particles there
-            if coarse_obs:
+            # Skip when RTK-initialized — let PF evolve smoothly via fine matching
+            if coarse_obs and not rtk_init:
                 top_e, top_n, top_sim = coarse_obs[0]
                 pf.inject_coarse_trust(top_e, top_n, top_sim)
 
@@ -350,26 +374,58 @@ def run_replay(
             viz.mkpts_drone = None
             viz.mkpts_patch = None
             if pf.should_run_fine():
-                fine_top_k = pf.get_fine_top_k()
-                ctx_frac = pf.get_context_fraction()
-                candidates_to_try = coarse.top_k_names[:fine_top_k]
                 fine_attempted += 1
+                fine_candidates = []  # (result, source_label) pairs
 
-                for cand_name in candidates_to_try:
-                    fine_result = obs.fine_match(frame_bgr, cand_name, context_fraction=ctx_frac)
-                    if fine_result is not None:
-                        viz.fine_matched_name = cand_name
-                        break
+                # A) Fine match on heading-rotated satellite mosaic (PF estimate)
+                if est_lat_prev is not None:
+                    fp_for_fine = reconstructor.reconstruct(
+                        est_lat_prev, est_lon_prev, current_altitude_m, est_hdg_prev,
+                        cam_fx, cam_fy, cam_w, cam_h,
+                        output_size=(320, 320),
+                    )
+                    if (fp_for_fine is not None and
+                            fp_for_fine.mosaic_rotated is not None and
+                            fp_for_fine.rotation_center_px is not None):
+                        mosaic_fine = obs.fine_match_on_mosaic(
+                            frame_bgr,
+                            fp_for_fine.mosaic_rotated,
+                            fp_for_fine.mosaic_meta,
+                            fp_for_fine.rotation_center_px,
+                            fp_for_fine.heading_deg,
+                        )
+                        if mosaic_fine is not None:
+                            fine_candidates.append((mosaic_fine, "mosaic"))
+
+                # B) Fine match on coarse top-1 patch
+                if coarse.top_k_names:
+                    ctx_frac = pf.get_context_fraction()
+                    patch_fine = obs.fine_match(frame_bgr, coarse.top_k_names[0],
+                                               context_fraction=ctx_frac)
+                    if patch_fine is not None:
+                        fine_candidates.append((patch_fine, coarse.top_k_names[0]))
+
+                # Pick the one with more inliers
+                if fine_candidates:
+                    fine_result, fine_source = max(fine_candidates, key=lambda x: x[0].inliers)
+                    viz.fine_matched_name = fine_source
 
                 if fine_result is not None:
-                    fine_succeeded += 1
                     fe, fn = enu.wgs84_to_enu(fine_result.lat, fine_result.lon)
-                    pf.update_fine(fe, fn, fine_result.inliers, fine_result.heading_deg)
-                    viz.fine_method = fine_result.method
-                    viz.fine_inliers = fine_result.inliers
-                    viz.mkpts_drone = fine_result.mkpts_drone
-                    viz.mkpts_patch = fine_result.mkpts_patch
-                    viz.fine_H = fine_result.H
+                    accepted = pf.update_fine(fe, fn, fine_result.inliers, fine_result.heading_deg)
+                    if accepted:
+                        fine_succeeded += 1
+                        viz.fine_method = f"{fine_result.method}({fine_source})"
+                        viz.fine_inliers = fine_result.inliers
+                        viz.mkpts_drone = fine_result.mkpts_drone
+                        viz.mkpts_patch = fine_result.mkpts_patch
+                        viz.fine_H = fine_result.H
+                    else:
+                        viz.fine_method = f"REJECTED ({fine_result.method})"
+                        viz.fine_inliers = fine_result.inliers
+                        viz.mkpts_drone = None
+                        viz.mkpts_patch = None
+                        viz.fine_H = None
                 else:
                     viz.mkpts_drone = None
                     viz.mkpts_patch = None
@@ -385,6 +441,7 @@ def run_replay(
             # Estimate
             est_e, est_n, est_hdg = pf.estimate()
             est_lat, est_lon = enu.enu_to_wgs84(est_e, est_n)
+            est_lat_prev, est_lon_prev, est_hdg_prev = est_lat, est_lon, est_hdg
 
             # Error vs ground truth
             error_m = haversine_m(est_lat, est_lon, gt_lat, gt_lon) if gt_lat is not None else -1.0
@@ -393,6 +450,26 @@ def run_replay(
 
             t_frame_ms = (time.monotonic() - t_frame_start) * 1000
             elapsed_s_frame = (ts_ns - t_start) * 1e-9
+
+            # Satellite footprint from PF estimate
+            top1_sim = coarse.top_k_sims[0] if coarse.top_k_sims else 0.0
+            fp_confidence = top1_sim
+            if fine_result is not None:
+                fp_confidence = min(1.0, top1_sim + 0.1 * fine_result.inliers / 20.0)
+            fp_result = reconstructor.reconstruct(
+                est_lat, est_lon, current_altitude_m, est_hdg,
+                cam_fx, cam_fy, cam_w, cam_h,
+                output_size=(320, 320),
+            )
+            if fp_result is not None:
+                viz.satellite_footprint = fp_result.satellite_crop
+                viz.footprint_confidence = fp_confidence
+                viz.footprint_info_str = (
+                    f"{fp_result.footprint_w_m:.0f}x{fp_result.footprint_h_m:.0f}m "
+                    f"sim={top1_sim:.2f}"
+                )
+            else:
+                viz.satellite_footprint = None
 
             # Debug visualization
             gt_e = enu.wgs84_to_enu(gt_lat, gt_lon)[0] if gt_lat is not None else None
@@ -812,6 +889,9 @@ if __name__ == "__main__":
                         help="Override altitude_min_process_m from config")
     parser.add_argument("--max-frames", type=int, default=None,
                         help="Stop after N camera frames (debug)")
+    parser.add_argument("--no-rtk-init", dest="rtk_init", action="store_false",
+                        help="Disable RTK init (use coarse-lock instead)")
+    parser.set_defaults(rtk_init=True)
     args = parser.parse_args()
     run_replay(
         args.config,
@@ -821,4 +901,5 @@ if __name__ == "__main__":
         cache_path=args.use_cache,
         altitude_min_override=args.altitude_min,
         max_frames=args.max_frames,
+        rtk_init=args.rtk_init,
     )

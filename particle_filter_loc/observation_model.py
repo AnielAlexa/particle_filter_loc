@@ -302,6 +302,125 @@ class ObservationModel:
             H=vis_H,
         )
 
+    def fine_match_on_mosaic(
+        self,
+        frame_bgr: np.ndarray,
+        mosaic_rotated: np.ndarray,
+        mosaic_meta: dict,
+        rotation_center_px: tuple,
+        heading_deg_rot: float,
+    ) -> Optional[FineResult]:
+        """Fine match drone frame against a heading-rotated satellite mosaic.
+
+        The mosaic has been rotated by heading_deg_rot around rotation_center_px
+        so that "up" in the mosaic aligns with the drone's forward direction.
+        Matched keypoints are un-rotated back to North-up before GPS conversion.
+
+        mosaic_meta: GPS bounds of the original North-up mosaic.
+        """
+        res = self.matcher_resolution
+        mh, mw = mosaic_rotated.shape[:2]
+
+        frame_cropped = _center_crop_square(frame_bgr)
+        q_gray = cv2.cvtColor(
+            cv2.resize(frame_cropped, (res, res)), cv2.COLOR_BGR2GRAY
+        ).astype(np.float32) / 255.0
+        p_gray = cv2.cvtColor(
+            cv2.resize(mosaic_rotated, (res, res)), cv2.COLOR_BGR2GRAY
+        ).astype(np.float32) / 255.0
+        q_np = q_gray[np.newaxis, np.newaxis]
+        p_np = p_gray[np.newaxis, np.newaxis]
+
+        try:
+            out = self.matcher.infer(q_np, p_np)
+        except Exception:
+            return None
+
+        mkpts0 = out.get("keypoints0")
+        mkpts1 = out.get("keypoints1")
+        mconf = out.get("mconf")
+
+        if mkpts0 is None or mkpts1 is None or mconf is None or len(mconf) == 0:
+            return None
+
+        mask = mconf > self.fine_conf_threshold
+        if mask.sum() < self.min_inliers_ransac:
+            return None
+
+        mkpts0 = mkpts0[mask]
+        mkpts1 = mkpts1[mask]
+
+        # Scale keypoints from matcher res to mosaic pixel space (rotated)
+        mkpts1_rot = mkpts1 * np.array([[mw / res, mh / res]], dtype=np.float32)
+
+        # Un-rotate keypoints back to North-up mosaic space
+        # Inverse of rotation by +heading around center = rotation by -heading
+        cx, cy = rotation_center_px
+        angle_rad = math.radians(-(heading_deg_rot + 90.0))  # undo the rotation (+90 camera mount offset)
+        cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
+        dx = mkpts1_rot[:, 0] - cx
+        dy = mkpts1_rot[:, 1] - cy
+        mkpts1_northup = np.column_stack([
+            cx + dx * cos_a - dy * sin_a,
+            cy + dx * sin_a + dy * cos_a,
+        ]).astype(np.float32)
+
+        # Build flat_meta for the North-up mosaic (original GPS bounds)
+        flat_meta = {
+            "min_lat": mosaic_meta["min_lat"],
+            "max_lat": mosaic_meta["max_lat"],
+            "min_lon": mosaic_meta["min_lon"],
+            "max_lon": mosaic_meta["max_lon"],
+            "patch_h": mh,
+            "patch_w": mw,
+        }
+
+        vis_H = None
+        if len(mkpts0) >= 4:
+            vis_H, _ = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
+
+        lat, lon, inliers, method, heading_deg_out = None, None, 0, "homography", None
+
+        if len(mkpts0) >= self.min_inliers_ransac:
+            pnp_result = self._pnp_refine_gps(mkpts0, mkpts1_northup, flat_meta)
+            if pnp_result is not None:
+                lat, lon, heading_deg_out, inliers = pnp_result
+                method = "pnp"
+
+        if lat is None:
+            if len(mkpts0) < 4:
+                return None
+            # Homography on North-up keypoints
+            H_northup, hm = cv2.findHomography(
+                mkpts0 * np.array([[mw / res, mh / res]], dtype=np.float32),  # scale drone kpts to match
+                mkpts1_northup, cv2.RANSAC, 5.0,
+            )
+            if H_northup is None:
+                return None
+            inliers = int(hm.sum())
+            if inliers < self.min_inliers_ransac:
+                return None
+            # Map drone center through homography to get GPS
+            cx_d = mw / 2.0
+            cy_d = mh / 2.0
+            pt = np.array([[[cx_d, cy_d]]], dtype=np.float32)
+            pt_res = cv2.perspectiveTransform(pt, H_northup)[0][0]
+            px = max(0.0, min(float(mw - 1), float(pt_res[0])))
+            py = max(0.0, min(float(mh - 1), float(pt_res[1])))
+            lat = flat_meta["max_lat"] - py * (flat_meta["max_lat"] - flat_meta["min_lat"]) / (mh - 1)
+            lon = flat_meta["min_lon"] + px * (flat_meta["max_lon"] - flat_meta["min_lon"]) / (mw - 1)
+            method = "homography"
+
+        if inliers < self.min_inliers:
+            return None
+
+        return FineResult(
+            lat=lat, lon=lon, inliers=inliers, method=method,
+            heading_deg=heading_deg_out, patch_name="mosaic",
+            mkpts_drone=mkpts0, mkpts_patch=mkpts1_rot,
+            H=vis_H,
+        )
+
     # ------------------------------------------------------------------
     # PnP refinement with heading extraction
     # ------------------------------------------------------------------

@@ -212,11 +212,15 @@ def build_debug_frame(
     coarse_top_k_sims: Optional[List[float]] = None,
     coarse_top_k_patches: Optional[List[Optional[np.ndarray]]] = None,
     fine_matched_name: str = "",
+    satellite_footprint: Optional[np.ndarray] = None,
+    footprint_confidence: float = 0.0,
+    footprint_info_str: str = "",
 ) -> np.ndarray:
     """
-    Builds a 4-panel + status-bar debug image:
-      [Drone frame | Coarse patch | Particle scatter | Minimap]
-      [                    Status bar                         ]
+    Builds a 5-panel + status-bar debug image:
+      [Drone frame | Sat footprint | Coarse patch | Particle scatter | Minimap]
+      [                         Candidates row                                ]
+      [                         Status bar                                    ]
     """
     phase = pf.phase
     phase_color = _PHASE_COLOR.get(phase, (255, 255, 255))
@@ -265,6 +269,28 @@ def build_debug_frame(
     cv2.putText(p2, "COARSE", (4, _PANEL_H - 6), cv2.FONT_HERSHEY_SIMPLEX,
                 0.45, (200, 200, 200), 1, cv2.LINE_AA)
 
+    # ------------------------------------------------------------------ #
+    # Panel 1b: satellite footprint (from PF estimate)
+    # ------------------------------------------------------------------ #
+    if satellite_footprint is not None:
+        p_sat = _resize(satellite_footprint)
+        # Confidence border: green=high, yellow=medium, red=low
+        if footprint_confidence >= 0.5:
+            border_color = (0, 200, 0)
+        elif footprint_confidence >= 0.3:
+            border_color = (0, 200, 200)
+        else:
+            border_color = (0, 80, 200)
+        cv2.rectangle(p_sat, (0, 0), (_PANEL_W - 1, _PANEL_H - 1), border_color, 2)
+        info = footprint_info_str or f"conf={footprint_confidence:.2f}"
+        _text(p_sat, [info], y0=20, scale=0.4, color=border_color)
+        cv2.putText(p_sat, "SATELLITE", (4, _PANEL_H - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (200, 200, 200), 1, cv2.LINE_AA)
+    else:
+        p_sat = _blank()
+        _text(p_sat, ["no footprint"])
+        cv2.putText(p_sat, "SATELLITE", (4, _PANEL_H - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (200, 200, 200), 1, cv2.LINE_AA)
 
     # ------------------------------------------------------------------ #
     # Panel 3: particle scatter (local ENU, zoomed)
@@ -326,7 +352,7 @@ def build_debug_frame(
     # ------------------------------------------------------------------ #
     # Candidates row
     # ------------------------------------------------------------------ #
-    n_panels = 4
+    n_panels = 5
     total_w = _PANEL_W * n_panels + _GAP * (n_panels - 1)
     cands_row = _build_candidates_row(
         names=coarse_top_k_names or [],
@@ -351,11 +377,12 @@ def build_debug_frame(
     # Assemble
     # ------------------------------------------------------------------ #
     gap = np.zeros((_PANEL_H, _GAP, 3), dtype=np.uint8)
-    top_row = np.hstack([p1, gap, p2, gap, p3, gap, p4])
+    top_row = np.hstack([p1, gap, p_sat, gap, p2, gap, p3, gap, p4])
 
-    # Draw correspondence lines between drone panel and patch panel
+    # Draw correspondence lines between drone panel and coarse patch panel
+    # Coarse patch is now panel 3 (after drone + gap + satellite + gap)
     if mkpts_drone is not None and mkpts_patch is not None and len(mkpts_drone) > 0:
-        p2_x0 = _PANEL_W + _GAP
+        p2_x0 = (_PANEL_W + _GAP) * 2  # skip drone + sat panels
         n_draw = min(len(mkpts_drone), 60)
         for i in range(n_draw):
             px_d = int(mkpts_drone[i, 0] * _PANEL_W / 320)
@@ -408,6 +435,11 @@ class DebugVisualizer:
         self.fine_method: str = ""
         self.fine_inliers: int = 0
 
+        # Satellite footprint
+        self.satellite_footprint: Optional[np.ndarray] = None
+        self.footprint_confidence: float = 0.0
+        self.footprint_info_str: str = ""
+
         # Accumulated trajectory history
         self._gt_path:  List[Tuple[float, float]] = []   # (east, north)
         self._pf_path:  List[Tuple[float, float]] = []
@@ -415,7 +447,7 @@ class DebugVisualizer:
 
         if show_window:
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-            total_w = _PANEL_W * 4 + _GAP * 3
+            total_w = _PANEL_W * 5 + _GAP * 4
             cv2.resizeWindow(window_name, total_w, _PANEL_H + _CANDS_H + _GAP + _STATUS_H)
             cv2.moveWindow(window_name, 80, 80)
 
@@ -468,6 +500,9 @@ class DebugVisualizer:
             coarse_top_k_sims=self.coarse_top_k_sims,
             coarse_top_k_patches=self.coarse_top_k_patches,
             fine_matched_name=self.fine_matched_name,
+            satellite_footprint=self.satellite_footprint,
+            footprint_confidence=self.footprint_confidence,
+            footprint_info_str=self.footprint_info_str,
         )
 
         if self.show_window:

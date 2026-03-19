@@ -35,7 +35,7 @@ particle_filter:
   altitude_sigma_ref_m: 60.0
   altitude_sigma_scale: 0.5
   # Fine match consistency gate (0 = disabled)
-  fine_consistency_max_m: 0.0
+  fine_consistency_max_m: 50.0     # reject fine matches > 50m from PF estimate
   # Strong coarse trust: if top-1 sim > threshold, teleport particles there
   # Set to 0.0 to disable
   coarse_trust_sim: 0.4
@@ -84,7 +84,7 @@ replay:
   rtk_topic: "/m300/rtk/fix"
   yaw_topic: "/m300/rtk/yaw"
   altimeter_topic: "/altimeter/range"
-  start_offset_s: 55.0        # skip this many seconds from bag start
+  start_offset_s: 20.0        # skip this many seconds from bag start
   camera_subsample: 1
   altitude_min_process_m: 50.0  # skip camera frames if median altitude below this
   output_csv: "results/pf_results.csv"
