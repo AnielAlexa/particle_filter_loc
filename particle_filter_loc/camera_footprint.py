@@ -1,7 +1,12 @@
 """Footprint-aware helpers for coarse/fine matching parameterization."""
 
+import math
 from dataclasses import dataclass
 from typing import Tuple
+
+import numpy as np
+
+from .geo_utils import ENUFrame
 
 
 @dataclass
@@ -65,6 +70,56 @@ def context_fraction_from_footprint(
     # on each side, expressed as fraction of patch_ground_size_m
     extra_each_side = max(0.0, (needed_span - patch_ground_size_m) / 2.0)
     return extra_each_side / patch_ground_size_m
+
+
+def compute_footprint_corners_gps(
+    fx: float, fy: float,
+    img_w: int, img_h: int,
+    altitude_m: float,
+    heading_deg: float,
+    center_lat: float, center_lon: float,
+    enu_frame: ENUFrame,
+) -> np.ndarray:
+    """Compute GPS coordinates of the camera's ground footprint corners.
+
+    Returns [4,2] array of (lat, lon) for the four corners in order:
+    top-left, top-right, bottom-right, bottom-left (relative to heading).
+    """
+    half_w = altitude_m * img_w / (2.0 * fx)
+    half_h = altitude_m * img_h / (2.0 * fy)
+
+    # Corners in local body frame (forward = +Y before rotation)
+    # TL, TR, BR, BL
+    corners_local = np.array([
+        [-half_w,  half_h],
+        [ half_w,  half_h],
+        [ half_w, -half_h],
+        [-half_w, -half_h],
+    ])
+
+    # Rotate by heading (CW from north → standard math rotation)
+    theta = math.radians(heading_deg)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    # Heading is CW from north; in ENU (east=x, north=y):
+    # east  =  x*cos(θ) + y*sin(θ)   [where θ is heading from north CW]
+    # north = -x*sin(θ) + y*cos(θ)
+    rot = np.array([
+        [ cos_t, sin_t],
+        [-sin_t, cos_t],
+    ])
+    corners_enu = corners_local @ rot.T
+
+    # Convert center to ENU, add offsets, convert back
+    center_e, center_n = enu_frame.wgs84_to_enu(center_lat, center_lon)
+    corners_gps = np.zeros((4, 2))
+    for i in range(4):
+        lat, lon = enu_frame.enu_to_wgs84(
+            center_e + corners_enu[i, 0],
+            center_n + corners_enu[i, 1],
+        )
+        corners_gps[i] = [lat, lon]
+
+    return corners_gps
 
 
 def scale_intrinsics(
