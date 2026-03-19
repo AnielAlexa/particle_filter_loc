@@ -9,21 +9,27 @@ particle_filter:
   sigma_pos_tracking: 1.0
   sigma_hdg_dispersed: 10.0
   sigma_hdg_tracking: 3.0
-  sigma_obs_coarse: 50.0
-  sigma_obs_fine: 5.0
+  sigma_obs_coarse: 40.0         # tuned: grid search best (40 > 30 prevents particle deprivation)
+  sigma_obs_fine: 5.0            # tuned: grid search best (5 < 8, tighter fine observation)
   top_k_coarse: 5
   ess_threshold_fraction: 0.5
-  init_altitude_m: 15.0
-  converge_spread_m: 80.0
-  tracking_spread_m: 20.0
+  init_altitude_m: 50.0          # tuned: was 15 — only init when high enough for VPR
+  converge_spread_m: 60.0        # tuned: grid search best
+  tracking_spread_m: 30.0        # tuned: grid search best (30 > 20, easier TRACKING entry)
   lost_spread_m: 150.0
-  fine_every_n_frames: 3
+  fine_every_n_frames: 2         # tuned: grid search best (more frequent fine updates)
   fine_min_inliers_heading: 12
   # Adaptive search (driven by particle spread)
   min_search_radius_m: 40.0
   search_radius_multiplier: 2.5
   base_context_fraction: 0.2
   max_context_fraction: 1.0
+  # Altitude-adaptive coarse sigma
+  altitude_sigma_enabled: false
+  altitude_sigma_ref_m: 60.0
+  altitude_sigma_scale: 0.5
+  # Fine match consistency gate (0 = disabled)
+  fine_consistency_max_m: 0.0
 
 matchers:
   script_dir: "/media/aniel/storage/bags_jetson/vpr_dinov3/dinov2_vits_layer_test"
@@ -41,7 +47,7 @@ matchers:
   camera_cx: 151.1
   camera_cy: 221.9
   context_enabled: true
-  context_fraction: 0.0
+  context_fraction: 0.5
   fine_conf_threshold: 0.20
   min_inliers_ransac: 4
   min_inliers: 8
@@ -58,5 +64,6 @@ replay:
   altimeter_topic: "/altimeter/range"
   start_offset_s: 55.0        # skip this many seconds from bag start
   camera_subsample: 1
+  altitude_min_process_m: 50.0  # skip camera frames if median altitude below this
   output_csv: "results/pf_results.csv"
   output_plot: "results/pf_trajectory.png"

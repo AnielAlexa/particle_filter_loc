@@ -25,11 +25,11 @@ class PFConfig:
     sigma_pos_tracking: float = 1.0
     sigma_hdg_dispersed: float = 10.0
     sigma_hdg_tracking: float = 3.0
-    sigma_obs_coarse: float = 50.0
-    sigma_obs_fine: float = 5.0
+    sigma_obs_coarse: float = 30.0      # was 50 — tighter at >50m altitude
+    sigma_obs_fine: float = 8.0         # was 5 — accounts for GPS metadata resolution
     top_k_coarse: int = 5
     ess_threshold_fraction: float = 0.5
-    init_altitude_m: float = 15.0
+    init_altitude_m: float = 50.0       # was 15 — only init when high enough for VPR
     converge_spread_m: float = 80.0
     tracking_spread_m: float = 20.0
     lost_spread_m: float = 150.0
@@ -39,6 +39,14 @@ class PFConfig:
     search_radius_multiplier: float = 2.5
     base_context_fraction: float = 0.25
     max_context_fraction: float = 1.0
+    # Altitude-adaptive coarse sigma: scale sigma_obs_coarse with altitude
+    altitude_sigma_enabled: bool = False
+    altitude_sigma_ref_m: float = 60.0   # reference altitude for sigma_obs_coarse
+    altitude_sigma_scale: float = 0.5    # sigma *= clamp(alt/ref * scale, 0.5, 2.0)
+    # Fine match consistency gate: reject fine updates too far from current estimate
+    # Prevents visually-ambiguous patches from jumping the PF across the map.
+    # Set to 0.0 to disable (always accept fine).
+    fine_consistency_max_m: float = 0.0
 
 
 class ParticleFilter:
@@ -60,8 +68,10 @@ class ParticleFilter:
             return True
         return altitude_m > self.cfg.init_altitude_m
 
-    def seed_from_coarse(self, patch_centers_enu: List[Tuple[float, float]], similarities: List[float]):
+    def seed_from_coarse(self, patch_centers_enu: List[Tuple[float, float]], similarities: List[float],
+                         sigma_override: Optional[float] = None):
         """Seed particles as Gaussian blobs around top-K coarse matches."""
+        sigma = sigma_override if sigma_override is not None else self.cfg.sigma_obs_coarse
         n = self.cfg.n_dispersed
         sims = np.array(similarities, dtype=np.float64)
         sims = np.clip(sims, 0, None)
@@ -81,8 +91,8 @@ class ParticleFilter:
         for (east, north), count in zip(patch_centers_enu, counts):
             if count <= 0:
                 continue
-            e = self.rng.normal(east, self.cfg.sigma_obs_coarse, size=count)
-            nn = self.rng.normal(north, self.cfg.sigma_obs_coarse, size=count)
+            e = self.rng.normal(east, sigma, size=count)
+            nn = self.rng.normal(north, sigma, size=count)
             h = self.rng.uniform(0, 360, size=count)
             particles.append(np.column_stack([e, nn, h]))
 
@@ -117,7 +127,17 @@ class ParticleFilter:
     # Observation updates
     # ------------------------------------------------------------------
 
+    def get_obs_sigma_coarse(self, altitude_m: float = 0.0) -> float:
+        """Return coarse observation sigma, optionally scaled by altitude."""
+        if not self.cfg.altitude_sigma_enabled or altitude_m <= 0.0:
+            return self.cfg.sigma_obs_coarse
+        # At higher altitude the drone footprint is larger → less precise patch center
+        scale = (altitude_m / self.cfg.altitude_sigma_ref_m) * self.cfg.altitude_sigma_scale
+        scale = max(0.5, min(scale, 2.0))
+        return self.cfg.sigma_obs_coarse * scale
+
     def update_coarse(self, top_k_patches: List[Tuple[float, float, float]],
+                      altitude_m: float = 0.0,
                       temperature: float = 0.05):
         """Update weights from coarse matches using a Gaussian mixture model.
 
@@ -138,7 +158,8 @@ class ParticleFilter:
         mix_w = np.exp(log_mix)
         mix_w /= mix_w.sum()  # [K]
 
-        sigma2 = 2.0 * self.cfg.sigma_obs_coarse ** 2
+        sigma = self.get_obs_sigma_coarse(altitude_m)
+        sigma2 = 2.0 * sigma ** 2
         N = len(self.particles)
 
         # log p(z | x_i) = logsumexp_k [ log(mix_w[k]) - dist(x_i, mu_k)^2 / sigma2 ]
@@ -165,10 +186,20 @@ class ParticleFilter:
             self.weights = np.full(N, 1.0 / N)
 
     def update_fine(self, fine_east: float, fine_north: float, inliers: int,
-                    heading_deg: Optional[float] = None):
-        """Update weights from fine match result."""
+                    heading_deg: Optional[float] = None) -> bool:
+        """Update weights from fine match result.
+
+        Returns True if update was applied, False if rejected by consistency gate.
+        """
         if self.particles is None:
-            return
+            return False
+
+        # Consistency gate: reject if fine match is too far from current estimate
+        if self.cfg.fine_consistency_max_m > 0.0:
+            est_e, est_n, _ = self.estimate()
+            dist = math.sqrt((fine_east - est_e) ** 2 + (fine_north - est_n) ** 2)
+            if dist > self.cfg.fine_consistency_max_m:
+                return False
 
         sigma2 = 2.0 * self.cfg.sigma_obs_fine ** 2
         dx = self.particles[:, 0] - fine_east
@@ -190,6 +221,7 @@ class ParticleFilter:
             self.weights /= total
         else:
             self.weights = np.full(len(self.weights), 1.0 / len(self.weights))
+        return True
 
     # ------------------------------------------------------------------
     # Resampling

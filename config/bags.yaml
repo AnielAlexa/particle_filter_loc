@@ -1,0 +1,51 @@
+# Multi-bag benchmark manifest.
+# Each entry can override any key from the `replay:` section of pf_config.yaml.
+# Altitude gating (altitude_min_process_m) makes incorrect start_offset_s safe —
+# frames during takeoff will be skipped automatically.
+
+base_config: "config/pf_config.yaml"
+
+bags:
+  - name: "Day2.1"
+    mcap_path: "/media/aniel/storage/bags_jetson/c6f4f561239128c653ca28007877f6a1/Day2.1_0.mcap"
+    start_offset_s: 0.0
+
+  - name: "Day2.2"
+    mcap_path: "/media/aniel/storage/bags_jetson/eaf2552402e96b1c2d6a7b92a666a10c/Day2.2_0.mcap"
+    start_offset_s: 0.0
+
+  - name: "Day2.5"
+    mcap_path: "/media/aniel/storage/bags_jetson/f4aec31f0ee5390ac105ff7d69712e7c/Day2.5_0.mcap"
+    start_offset_s: 0.0
+
+  - name: "Day2.5_70s"
+    mcap_path: "/media/aniel/storage/bags_jetson/31b7e1ed1ccb139c120a07fcd8fa4def/Day2.5_70s_0.mcap"
+    start_offset_s: 0.0
+    notes: "Short segment; high variance metrics expected"
+
+  - name: "Day2.6"
+    mcap_path: "/media/aniel/storage/bags_jetson/095c6d2c7237fe986c6240628b6ef8dd/Day2.6_0.mcap"
+    start_offset_s: 55.0
+    notes: "Reference bag; original start_offset_s from tuning"
+
+  - name: "Day3.1"
+    mcap_path: "/media/aniel/storage/bags_jetson/1f24cb6af4e6fea2d9d31829715aad95/Day3.1_0.mcap"
+    start_offset_s: 0.0
+
+  - name: "Day3.2"
+    mcap_path: "/media/aniel/storage/bags_jetson/7e84212b99537e93c8dab7cdde6ca76b/Day3.2_0.mcap"
+    start_offset_s: 0.0
+
+  - name: "Day3.3"
+    mcap_path: "/media/aniel/storage/bags_jetson/bea276eb8b0c91f69e638c5994519cba/Day3.3_0.mcap"
+    start_offset_s: 0.0
+    notes: "Largest bag (17GB); cache generation will take ~1.5h"
+
+  - name: "Day4.2"
+    mcap_path: "/media/aniel/storage/bags_jetson/3b12c33fb6c0c824e5461dc5656404cc/Day4.2_0.mcap"
+    start_offset_s: 0.0
+
+  - name: "Day4.3"
+    mcap_path: "/media/aniel/storage/bags_jetson/991dce18c6051d7043042d2482c94455/Day4.3_0.mcap"
+    start_offset_s: 0.0
+    notes: "Large bag (12GB)"

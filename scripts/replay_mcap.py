@@ -2,12 +2,16 @@
 """Offline MCAP replay for particle filter geo-localization evaluation."""
 
 import argparse
+import copy
 import csv
 import os
+import pickle
 import sys
 import time
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -18,7 +22,7 @@ PKG_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PKG_DIR))
 
 from particle_filter_loc.geo_utils import ENUFrame, haversine_m
-from particle_filter_loc.motion_model import RTKMotionModel
+from particle_filter_loc.motion_model import RTKMotionModel, MotionDelta
 from particle_filter_loc.particle_filter import PFConfig, ParticleFilter, Phase
 from particle_filter_loc.observation_model import ObservationModel
 from particle_filter_loc.debug_viz import DebugVisualizer
@@ -29,47 +33,86 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def run_replay(config_path: str, show_window: bool = False, save_frames: bool = False):
-    cfg = load_config(config_path)
+def _build_pf_config(pf_cfg_dict: dict) -> PFConfig:
+    return PFConfig(**pf_cfg_dict)
+
+
+def run_replay(
+    config,                           # str path or dict
+    show_window: bool = False,
+    save_frames: bool = False,
+    save_cache: bool = False,
+    cache_path: Optional[str] = None, # if set, skip TRT and replay from cache
+    altitude_min_override: Optional[float] = None,
+    max_frames: Optional[int] = None, # stop after this many camera frames (debug)
+    bag_name: Optional[str] = None,   # override bag name for output dirs
+) -> dict:
+    """Run replay and return summary metrics dict.
+
+    Modes:
+      - Normal (no cache flags): runs TRT matchers, outputs CSV/plot
+      - save_cache=True: same as normal but also writes match_cache.pkl
+      - cache_path set: skips MCAP+TRT, replays PF from cache file
+    """
+    if isinstance(config, str):
+        cfg = load_config(config)
+    else:
+        cfg = copy.deepcopy(config)
 
     # ENU frame
     enu = ENUFrame(cfg["enu_origin"]["lat"], cfg["enu_origin"]["lon"])
 
     # PF config
     pf_cfg_dict = cfg["particle_filter"]
-    pf_config = PFConfig(**pf_cfg_dict)
+    pf_config = _build_pf_config(pf_cfg_dict)
 
+    # Replay config
+    rcfg = cfg["replay"]
+    mcap_path = rcfg["mcap_path"]
+    camera_topic = rcfg.get("camera_topic", "/camera/image_mono")
+    rtk_topic    = rcfg.get("rtk_topic",    "/m300/rtk/fix")
+    yaw_topic    = rcfg.get("yaw_topic",    "/m300/rtk/yaw")
+    altimeter_topic = rcfg.get("altimeter_topic", "/altimeter/range")
+    camera_subsample = rcfg.get("camera_subsample", 1)
+    start_offset_s   = rcfg.get("start_offset_s", 0.0)
+    altitude_min_m   = altitude_min_override if altitude_min_override is not None \
+                       else rcfg.get("altitude_min_process_m", 0.0)
+
+    # Derive bag name for outputs
+    if bag_name is None:
+        bag_stem = Path(mcap_path).stem  # e.g. "Day2.6_0"
+        bag_name = bag_stem.replace("_0", "")  # e.g. "Day2.6"
+
+    output_csv  = Path(PKG_DIR) / "results" / bag_name / "pf_results.csv"
+    output_plot = Path(PKG_DIR) / "results" / bag_name / "pf_trajectory.png"
+    cache_out   = Path(PKG_DIR) / "results" / bag_name / "match_cache.pkl"
+
+    # Legacy single-bag outputs (symlink-style fallback kept for backward compat)
+    if "output_csv" in rcfg:
+        legacy_csv = Path(PKG_DIR) / rcfg["output_csv"]
+        output_csv = legacy_csv
+        output_plot = Path(PKG_DIR) / rcfg["output_plot"]
+        cache_out = output_csv.parent / "match_cache.pkl"
+
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    # ---- CACHE READ MODE ----
+    if cache_path is not None:
+        return _replay_from_cache(
+            cache_path=cache_path,
+            pf_config=pf_config,
+            lock_cfg=cfg.get("init", {}),
+            altitude_min_m=altitude_min_m,
+            output_csv=str(output_csv),
+            output_plot=str(output_plot),
+        )
+
+    # ---- FULL MCAP REPLAY ----
     # Components
     pf = ParticleFilter(pf_config)
     motion = RTKMotionModel()
     matchers_cfg = cfg["matchers"]
     obs = ObservationModel(matchers_cfg, enu)
-
-    # Replay config
-    rcfg = cfg["replay"]
-    mcap_path = rcfg["mcap_path"]
-    camera_topic = rcfg["camera_topic"]
-    rtk_topic = rcfg["rtk_topic"]
-    yaw_topic = rcfg["yaw_topic"]
-    altimeter_topic = rcfg["altimeter_topic"]
-    camera_subsample = rcfg.get("camera_subsample", 1)
-    start_offset_s   = rcfg.get("start_offset_s", 0.0)
-    output_csv = Path(PKG_DIR) / rcfg["output_csv"]
-    output_plot = Path(PKG_DIR) / rcfg["output_plot"]
-
-    # Ensure output dirs exist
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    output_plot.parent.mkdir(parents=True, exist_ok=True)
-
-    # Open MCAP
-    from mcap.reader import make_reader
-    from mcap_ros2.decoder import DecoderFactory
-
-    print(f"Opening MCAP: {mcap_path}")
-    bag_file = open(mcap_path, "rb")
-    reader = make_reader(bag_file, decoder_factories=[DecoderFactory()])
-
-    topics = [camera_topic, rtk_topic, yaw_topic, altimeter_topic]
 
     # Debug visualizer
     debug_frames_dir = str(output_csv.parent / "debug_frames") if save_frames else None
@@ -80,11 +123,12 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
     )
 
     # Coarse-lock parameters (pre-seed accumulator)
-    lock_n_frames    = cfg.get("init", {}).get("lock_n_frames", 4)
-    lock_sim_thresh  = cfg.get("init", {}).get("lock_sim_threshold", 0.40)
+    lock_n_frames   = cfg.get("init", {}).get("lock_n_frames", 4)
+    lock_sim_thresh = cfg.get("init", {}).get("lock_sim_threshold", 0.40)
 
     # State
     altitude_buf = deque(maxlen=10)
+    current_altitude_m = 0.0
     gt_lat, gt_lon = None, None
     camera_frame_idx = 0
     initialized = False
@@ -95,11 +139,26 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
     fine_succeeded = 0
 
     # Pre-seed coarse-lock state
-    _lock_patch: str = ""          # current candidate patch
-    _lock_count: int = 0           # consecutive hits on that patch
-    _lock_sims:  list = []         # sim scores during the lock streak
+    _lock_patch: str = ""
+    _lock_count: int = 0
+    _lock_sims:  list = []
 
-    print("Starting replay...")
+    # Cache accumulation state
+    cache_frames = []                 # list of frame dicts (index 0 = header, set at end)
+    _pending_rtk_deltas = []          # RTK deltas since last camera frame
+
+    print(f"[{bag_name}] Opening MCAP: {mcap_path}")
+    print(f"[{bag_name}] Altitude gating: process frames >= {altitude_min_m:.0f}m")
+
+    from mcap.reader import make_reader
+    from mcap_ros2.decoder import DecoderFactory
+
+    bag_file = open(mcap_path, "rb")
+    reader = make_reader(bag_file, decoder_factories=[DecoderFactory()])
+
+    topics = [camera_topic, rtk_topic, yaw_topic, altimeter_topic]
+
+    print(f"[{bag_name}] Starting replay...")
 
     for schema, channel, message, decoded_msg in reader.iter_decoded_messages(topics=topics):
         topic = channel.topic
@@ -108,20 +167,22 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
         if t_start is None:
             t_start = ts_ns
 
+        elapsed_s = (ts_ns - t_start) * 1e-9
+
         # Skip messages before start offset
-        if (ts_ns - t_start) * 1e-9 < start_offset_s:
+        if elapsed_s < start_offset_s:
             continue
 
         # --- Altimeter ---
         if topic == altimeter_topic:
-            # Range message — .range field
             alt = float(decoded_msg.range)
             altitude_buf.append(alt)
+            current_altitude_m = float(np.median(altitude_buf)) if altitude_buf else alt
             if not initialized and len(altitude_buf) >= 5:
-                median_alt = float(np.median(altitude_buf))
-                if pf.try_init(median_alt):
+                if pf.try_init(current_altitude_m):
                     initialized = True
-                    print(f"  Altitude init: median={median_alt:.1f}m > {pf_config.init_altitude_m}m")
+                    print(f"  [{bag_name}] Altitude init: median={current_altitude_m:.1f}m "
+                          f"> {pf_config.init_altitude_m}m")
             continue
 
         # --- Yaw ---
@@ -139,8 +200,13 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
                 delta = motion.update(ts_ns, lat=lat, lon=lon)
                 if delta is not None:
                     pf.predict(delta)
+                    _pending_rtk_deltas.append({
+                        "dx_m": delta.dx_m,
+                        "dy_m": delta.dy_m,
+                        "heading_deg": delta.heading_deg,
+                        "dt_s": delta.dt_s,
+                    })
             else:
-                # Still need to feed RTK to motion model for delta tracking
                 motion.update(ts_ns, lat=lat, lon=lon)
             continue
 
@@ -153,7 +219,27 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
             if camera_frame_idx % camera_subsample != 0:
                 continue
 
-            # Decode mono8 image
+            if max_frames is not None and camera_frame_idx > max_frames:
+                print(f"  [{bag_name}] Reached max_frames={max_frames}, stopping.")
+                break
+
+            # --- Altitude gating ---
+            if altitude_min_m > 0.0 and current_altitude_m < altitude_min_m:
+                if save_cache:
+                    cache_frames.append({
+                        "timestamp_ns": ts_ns,
+                        "elapsed_s": elapsed_s,
+                        "frame_idx": camera_frame_idx,
+                        "altitude_m": current_altitude_m,
+                        "gt_lat": gt_lat or 0.0,
+                        "gt_lon": gt_lon or 0.0,
+                        "gated_out": True,
+                        "rtk_deltas": _pending_rtk_deltas,
+                    })
+                _pending_rtk_deltas = []
+                continue
+
+            # Decode image
             h = decoded_msg.height
             w = decoded_msg.width
             if decoded_msg.encoding == "mono8":
@@ -164,6 +250,7 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
                 if decoded_msg.encoding == "rgb8":
                     frame_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_RGB2BGR)
             else:
+                _pending_rtk_deltas = []
                 continue
 
             t_frame_start = time.monotonic()
@@ -179,27 +266,22 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
                     _lock_count += 1
                     _lock_sims.append(top1_sim)
                 else:
-                    # Reset streak — new candidate
                     _lock_patch = top1_name
                     _lock_count = 1
                     _lock_sims  = [top1_sim] if top1_sim >= lock_sim_thresh else []
 
-                print(f"  [UNINIT] top1={top1_name} sim={top1_sim:.3f}  "
+                print(f"  [{bag_name}|UNINIT] top1={top1_name} sim={top1_sim:.3f}  "
                       f"lock={_lock_count}/{lock_n_frames}")
 
                 if _lock_count >= lock_n_frames and len(_lock_sims) >= lock_n_frames:
-                    # Confirmed lock — seed PF with spread tightened by sqrt(N)
                     mean_sim = float(np.mean(_lock_sims))
                     tight_sigma = pf_config.sigma_obs_coarse / np.sqrt(_lock_count)
                     centers_enu = [obs.get_patch_center_enu(n) for n in coarse.top_k_names]
-                    # Temporarily override seed spread
-                    orig_sigma = pf_config.sigma_obs_coarse
-                    pf_config.sigma_obs_coarse = tight_sigma
-                    pf.seed_from_coarse(centers_enu, coarse.top_k_sims)
-                    pf_config.sigma_obs_coarse = orig_sigma
-                    print(f"  PF seeded after {_lock_count}-frame lock: "
+                    pf.seed_from_coarse(centers_enu, coarse.top_k_sims, sigma_override=tight_sigma)
+                    print(f"  [{bag_name}] PF seeded after {_lock_count}-frame lock: "
                           f"patch={_lock_patch}  mean_sim={mean_sim:.3f}  "
                           f"seed_sigma={tight_sigma:.1f}m")
+                _pending_rtk_deltas = []
                 continue
 
             # --- Coarse match (adaptive radius) ---
@@ -216,7 +298,7 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
             coarse = obs.coarse_match(frame_bgr, candidate_indices=candidate_indices,
                                        top_k=pf_config.top_k_coarse)
 
-            # Cache coarse result in visualizer
+            # Visualizer cache
             viz.coarse_name = coarse.top_k_names[0] if coarse.top_k_names else ""
             viz.coarse_sim = coarse.top_k_sims[0] if coarse.top_k_sims else 0.0
             viz.coarse_top_k_names = coarse.top_k_names
@@ -232,12 +314,15 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
             viz.fine_method = ""
             viz.fine_inliers = 0
 
-            # Update PF with coarse observations
+            # Build coarse obs with ENU centers
             coarse_obs = []
+            coarse_top_k_enu = []
             for name, sim in zip(coarse.top_k_names, coarse.top_k_sims):
                 e, n = obs.get_patch_center_enu(name)
                 coarse_obs.append((e, n, sim))
-            pf.update_coarse(coarse_obs)
+                coarse_top_k_enu.append((e, n))
+
+            pf.update_coarse(coarse_obs, altitude_m=current_altitude_m)
 
             # --- Fine match (adaptive) ---
             fine_result = None
@@ -273,7 +358,6 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
             pf.resample_if_needed()
             pf.check_transitions()
 
-            # Track when we first enter TRACKING
             if pf.phase == Phase.TRACKING and tracking_start_ts is None:
                 tracking_start_ts = ts_ns
 
@@ -287,12 +371,12 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
             spread = pf.weighted_spread()
 
             t_frame_ms = (time.monotonic() - t_frame_start) * 1000
-            elapsed_s = (ts_ns - t_start) * 1e-9
+            elapsed_s_frame = (ts_ns - t_start) * 1e-9
 
             # Debug visualization
             gt_e = enu.wgs84_to_enu(gt_lat, gt_lon)[0] if gt_lat is not None else None
             gt_n = enu.wgs84_to_enu(gt_lat, gt_lon)[1] if gt_lat is not None else None
-            viz.update(pf, frame_bgr, error_m=error_m, elapsed_s=elapsed_s,
+            viz.update(pf, frame_bgr, error_m=error_m, elapsed_s=elapsed_s_frame,
                        gt_east=gt_e, gt_north=gt_n)
 
             results.append({
@@ -303,6 +387,7 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
                 "gt_lat": gt_lat if gt_lat else 0.0,
                 "gt_lon": gt_lon if gt_lon else 0.0,
                 "error_m": error_m,
+                "altitude_m": current_altitude_m,
                 "ess": ess,
                 "spread_m": spread,
                 "state": pf.phase.name,
@@ -310,14 +395,43 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
                 "fine_inliers": fine_result.inliers if fine_result else 0,
             })
 
+            # Build cache frame
+            if save_cache:
+                fine_cache = None
+                if fine_result is not None:
+                    fe_c, fn_c = enu.wgs84_to_enu(fine_result.lat, fine_result.lon)
+                    fine_cache = {
+                        "east_m": fe_c,
+                        "north_m": fn_c,
+                        "inliers": fine_result.inliers,
+                        "heading_deg": fine_result.heading_deg,
+                        "method": fine_result.method,
+                        "patch_name": fine_result.patch_name,
+                    }
+                cache_frames.append({
+                    "timestamp_ns": ts_ns,
+                    "elapsed_s": elapsed_s_frame,
+                    "frame_idx": camera_frame_idx,
+                    "altitude_m": current_altitude_m,
+                    "gt_lat": gt_lat or 0.0,
+                    "gt_lon": gt_lon or 0.0,
+                    "coarse_top_k_names": list(coarse.top_k_names),
+                    "coarse_top_k_sims":  list(coarse.top_k_sims),
+                    "coarse_top_k_enu":   coarse_top_k_enu,
+                    "fine_result": fine_cache,
+                    "rtk_deltas": _pending_rtk_deltas,
+                })
+
+            _pending_rtk_deltas = []
+
             if camera_frame_idx % 10 == 0:
                 fine_rate = f"{fine_succeeded}/{fine_attempted}" if fine_attempted else "0/0"
-                print(f"  [{elapsed_s:6.1f}s] frame={camera_frame_idx:4d}  "
-                      f"phase={pf.phase.name:11s}  error={error_m:6.1f}m  "
+                print(f"  [{bag_name}|{elapsed_s_frame:6.1f}s] frame={camera_frame_idx:4d}  "
+                      f"phase={pf.phase.name:11s}  alt={current_altitude_m:5.1f}m  "
+                      f"error={error_m:6.1f}m  "
                       f"spread={spread:5.1f}m  ESS={ess:5.1f}  "
                       f"fine={fine_rate}  t={t_frame_ms:5.1f}ms")
 
-                # Patch vs RTK coordinate comparison (raw = before any offset correction)
                 top1 = coarse.top_k_names[0] if coarse.top_k_names else ""
                 if top1 and gt_lat is not None:
                     p = obs.gps_metadata.get(top1, {})
@@ -332,51 +446,243 @@ def run_replay(config_path: str, show_window: bool = False, save_frames: bool = 
     bag_file.close()
     viz.close()
 
-    if not results:
-        print("No results collected.")
-        return
+    # ---- Write cache ----
+    if save_cache and cache_frames:
+        header = {
+            "__cache_version__": 1,
+            "bag_name": bag_name,
+            "mcap_path": mcap_path,
+            "start_offset_s": start_offset_s,
+            "altitude_min_process_m": altitude_min_m,
+            "enu_origin": {"lat": cfg["enu_origin"]["lat"], "lon": cfg["enu_origin"]["lon"]},
+            "pf_config_snapshot": dict(pf_cfg_dict),
+            "matchers_config_snapshot": dict(matchers_cfg),
+            "n_frames": len(cache_frames),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        payload = [header] + cache_frames
+        cache_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(cache_out), "wb") as f:
+            pickle.dump(payload, f, protocol=4)
+        print(f"[{bag_name}] Match cache saved: {cache_out}  ({len(cache_frames)} frames)")
 
-    # --- Write CSV ---
+    return _finalize_results(results, output_csv, output_plot, t_start,
+                              tracking_start_ts, fine_attempted, fine_succeeded, bag_name)
+
+
+def _replay_from_cache(
+    cache_path: str,
+    pf_config: PFConfig,
+    lock_cfg: dict,
+    altitude_min_m: float,
+    output_csv: str,
+    output_plot: str,
+) -> dict:
+    """PF-only replay from a match cache file. No TRT, no MCAP."""
+    print(f"[cache] Loading: {cache_path}")
+    with open(cache_path, "rb") as f:
+        payload = pickle.load(f)
+
+    header = payload[0]
+    cache_frames = payload[1:]
+    bag_name = header.get("bag_name", Path(cache_path).parent.name)
+    enu = ENUFrame(header["enu_origin"]["lat"], header["enu_origin"]["lon"])
+
+    print(f"[{bag_name}|cache] {len(cache_frames)} frames  "
+          f"(created {header.get('created_at', '?')})")
+
+    # Warn if matchers config has changed (cache may be stale)
+    # (caller can check; we just print)
+
+    lock_n_frames   = lock_cfg.get("lock_n_frames", 4)
+    lock_sim_thresh = lock_cfg.get("lock_sim_threshold", 0.40)
+
+    pf = ParticleFilter(pf_config, rng_seed=42)
+    results = []
+    initialized = False
+    tracking_start_ts = None
+    fine_attempted = fine_succeeded = 0
+    _lock_patch = ""
+    _lock_count = 0
+    _lock_sims  = []
+    t_start_ns  = cache_frames[0]["timestamp_ns"] if cache_frames else 0
+
+    for frame in cache_frames:
+        ts_ns   = frame["timestamp_ns"]
+        alt     = frame["altitude_m"]
+        gt_lat  = frame["gt_lat"]
+        gt_lon  = frame["gt_lon"]
+        elapsed = frame.get("elapsed_s", (ts_ns - t_start_ns) * 1e-9)
+
+        # Apply RTK deltas (even for gated frames — drone moved)
+        for d in frame.get("rtk_deltas", []):
+            if pf.particles is not None:
+                pf.predict(MotionDelta(**d))
+
+        if frame.get("gated_out"):
+            continue
+
+        # Altitude gating (may differ from cache's original gating if config changed)
+        if altitude_min_m > 0.0 and alt < altitude_min_m:
+            continue
+
+        if not initialized:
+            if pf.try_init(alt):
+                initialized = True
+                print(f"  [{bag_name}|cache] Altitude init: {alt:.1f}m")
+            else:
+                continue
+
+        coarse_names = frame.get("coarse_top_k_names", [])
+        coarse_sims  = frame.get("coarse_top_k_sims",  [])
+        coarse_enu   = frame.get("coarse_top_k_enu",   [])
+
+        # Pre-seed lock logic
+        if pf.phase == Phase.UNINIT:
+            top1_name = coarse_names[0] if coarse_names else ""
+            top1_sim  = coarse_sims[0]  if coarse_sims  else 0.0
+            if top1_name == _lock_patch and top1_sim >= lock_sim_thresh:
+                _lock_count += 1
+                _lock_sims.append(top1_sim)
+            else:
+                _lock_patch = top1_name
+                _lock_count = 1
+                _lock_sims  = [top1_sim] if top1_sim >= lock_sim_thresh else []
+
+            if _lock_count >= lock_n_frames and len(_lock_sims) >= lock_n_frames:
+                tight_sigma = pf_config.sigma_obs_coarse / np.sqrt(_lock_count)
+                centers_enu = [c for c in coarse_enu]
+                pf.seed_from_coarse(centers_enu, coarse_sims, sigma_override=tight_sigma)
+                print(f"  [{bag_name}|cache] PF seeded: sigma={tight_sigma:.1f}m")
+            continue
+
+        # Coarse update
+        coarse_obs = [(e, n, s) for (e, n), s in zip(coarse_enu, coarse_sims)]
+        if coarse_obs:
+            pf.update_coarse(coarse_obs, altitude_m=alt)
+
+        # Fine update (use cache's fine result if PF decides to run fine this frame)
+        fine_cache = frame.get("fine_result")
+        run_fine = pf.should_run_fine()
+        if fine_cache and run_fine:
+            fine_attempted += 1
+            fe = fine_cache["east_m"]
+            fn = fine_cache["north_m"]
+            pf.update_fine(fe, fn, fine_cache["inliers"], fine_cache.get("heading_deg"))
+            fine_succeeded += 1
+        elif run_fine:
+            fine_attempted += 1
+
+        pf.resample_if_needed()
+        pf.check_transitions()
+
+        if pf.phase == Phase.TRACKING and tracking_start_ts is None:
+            tracking_start_ts = ts_ns
+
+        est_e, est_n, est_hdg = pf.estimate()
+        est_lat, est_lon = enu.enu_to_wgs84(est_e, est_n)
+        error_m = haversine_m(est_lat, est_lon, gt_lat, gt_lon) if gt_lat else -1.0
+        spread = pf.weighted_spread()
+        ess = pf.effective_sample_size()
+
+        results.append({
+            "timestamp_ns": ts_ns,
+            "est_lat": est_lat,
+            "est_lon": est_lon,
+            "est_heading": est_hdg,
+            "gt_lat": gt_lat,
+            "gt_lon": gt_lon,
+            "error_m": error_m,
+            "altitude_m": alt,
+            "ess": ess,
+            "spread_m": spread,
+            "state": pf.phase.name,
+            "fine_method": "",
+            "fine_inliers": fine_cache.get("inliers", 0) if fine_cache else 0,
+        })
+
+    return _finalize_results(results, output_csv, output_plot, t_start_ns,
+                              tracking_start_ts, fine_attempted, fine_succeeded, bag_name)
+
+
+def _finalize_results(results, output_csv, output_plot, t_start,
+                      tracking_start_ts, fine_attempted, fine_succeeded, bag_name) -> dict:
+    if not results:
+        print(f"[{bag_name}] No results collected.")
+        return {"bag_name": bag_name, "n_frames": 0,
+                "median_err_all": -1, "median_err_tracking": -1,
+                "p90_err": -1, "converge_s": -1, "fine_rate_pct": 0.0}
+
+    # Write CSV
+    Path(output_csv).parent.mkdir(parents=True, exist_ok=True)
     fieldnames = list(results[0].keys())
     with open(str(output_csv), "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(results)
-    print(f"\nResults saved to {output_csv}")
+    print(f"[{bag_name}] Results saved: {output_csv}")
 
-    # --- Summary metrics ---
+    # Summary metrics
     errors = [r["error_m"] for r in results if r["error_m"] >= 0]
     tracking_errors = [r["error_m"] for r in results if r["error_m"] >= 0 and r["state"] == "TRACKING"]
+    tracking_errors_arr = np.array(tracking_errors) if tracking_errors else np.array([])
 
-    print("\n=== Summary ===")
+    median_all = float(np.median(errors)) if errors else -1.0
+    mean_all   = float(np.mean(errors)) if errors else -1.0
+    p90_all    = float(np.percentile(errors, 90)) if errors else -1.0
+    max_all    = float(np.max(errors)) if errors else -1.0
+
+    median_track = float(np.median(tracking_errors_arr)) if len(tracking_errors_arr) else -1.0
+    mean_track   = float(np.mean(tracking_errors_arr)) if len(tracking_errors_arr) else -1.0
+    p90_track    = float(np.percentile(tracking_errors_arr, 90)) if len(tracking_errors_arr) else -1.0
+
+    converge_s = -1.0
+    if tracking_start_ts and t_start:
+        converge_s = float((tracking_start_ts - t_start) * 1e-9)
+
+    fine_rate_pct = 100.0 * fine_succeeded / max(fine_attempted, 1)
+
+    print(f"\n[{bag_name}] === Summary ===")
     if errors:
         errors_np = np.array(errors)
-        print(f"All frames:      median={np.median(errors_np):.1f}m  "
-              f"mean={np.mean(errors_np):.1f}m  "
-              f"90th={np.percentile(errors_np, 90):.1f}m  "
-              f"max={np.max(errors_np):.1f}m")
-    if tracking_errors:
-        te = np.array(tracking_errors)
-        print(f"TRACKING only:   median={np.median(te):.1f}m  "
-              f"mean={np.mean(te):.1f}m  "
-              f"90th={np.percentile(te, 90):.1f}m  "
-              f"max={np.max(te):.1f}m")
-    if tracking_start_ts and t_start:
-        convergence_s = (tracking_start_ts - t_start) * 1e-9
-        print(f"Time to TRACKING: {convergence_s:.1f}s")
-    print(f"Total frames processed: {len(results)}")
-    print(f"Fine match rate: {fine_succeeded}/{fine_attempted} "
-          f"({100*fine_succeeded/max(fine_attempted,1):.1f}%)")
+        print(f"  All frames:      median={median_all:.1f}m  "
+              f"mean={mean_all:.1f}m  "
+              f"90th={p90_all:.1f}m  "
+              f"max={max_all:.1f}m")
+    if len(tracking_errors_arr):
+        print(f"  TRACKING only:   median={median_track:.1f}m  "
+              f"mean={mean_track:.1f}m  "
+              f"90th={p90_track:.1f}m")
+    if converge_s >= 0:
+        print(f"  Time to TRACKING: {converge_s:.1f}s")
+    print(f"  Total frames: {len(results)}")
+    print(f"  Fine match rate: {fine_succeeded}/{fine_attempted} ({fine_rate_pct:.1f}%)")
 
-    # --- Plot ---
+    # Plot
     try:
-        _generate_plot(results, str(output_plot), t_start)
-        print(f"Plot saved to {output_plot}")
+        _generate_plot(results, str(output_plot), t_start, bag_name)
+        print(f"[{bag_name}] Plot saved: {output_plot}")
     except Exception as e:
-        print(f"Plot generation failed: {e}")
+        print(f"[{bag_name}] Plot failed: {e}")
+
+    return {
+        "bag_name": bag_name,
+        "n_frames": len(results),
+        "median_err_all": median_all,
+        "mean_err_all": mean_all,
+        "p90_err": p90_all,
+        "max_err": max_all,
+        "median_err_tracking": median_track,
+        "mean_err_tracking": mean_track,
+        "p90_err_tracking": p90_track,
+        "converge_s": converge_s,
+        "fine_rate_pct": fine_rate_pct,
+        "fine_succeeded": fine_succeeded,
+        "fine_attempted": fine_attempted,
+    }
 
 
-def _generate_plot(results: list, output_path: str, t_start: int):
+def _generate_plot(results: list, output_path: str, t_start: int, bag_name: str = ""):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -384,18 +690,20 @@ def _generate_plot(results: list, output_path: str, t_start: int):
     ts = np.array([(r["timestamp_ns"] - t_start) * 1e-9 for r in results])
     est_lat = np.array([r["est_lat"] for r in results])
     est_lon = np.array([r["est_lon"] for r in results])
-    gt_lat = np.array([r["gt_lat"] for r in results])
-    gt_lon = np.array([r["gt_lon"] for r in results])
-    errors = np.array([r["error_m"] for r in results])
-    ess = np.array([r["ess"] for r in results])
-    spread = np.array([r["spread_m"] for r in results])
-    states = [r["state"] for r in results]
+    gt_lat  = np.array([r["gt_lat"]  for r in results])
+    gt_lon  = np.array([r["gt_lon"]  for r in results])
+    errors  = np.array([r["error_m"] for r in results])
+    ess     = np.array([r["ess"]     for r in results])
+    spread  = np.array([r["spread_m"] for r in results])
+    alts    = np.array([r.get("altitude_m", 0.0) for r in results])
+    states  = [r["state"] for r in results]
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f"PF Evaluation — {bag_name}", fontsize=13)
 
     # 1. Trajectory
     ax = axes[0, 0]
-    ax.plot(gt_lon, gt_lat, "b-", alpha=0.5, label="GT", linewidth=1)
+    ax.plot(gt_lon, gt_lat, "b-", alpha=0.5, label="GT (RTK)", linewidth=1)
     ax.plot(est_lon, est_lat, "r-", alpha=0.7, label="PF estimate", linewidth=1)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
@@ -405,13 +713,27 @@ def _generate_plot(results: list, output_path: str, t_start: int):
 
     # 2. Error vs time
     ax = axes[0, 1]
-    ax.plot(ts, errors, "k-", linewidth=0.8)
+    tracking_mask = np.array([s == "TRACKING" for s in states])
+    ax.plot(ts, errors, "k-", linewidth=0.8, alpha=0.5, label="all")
+    if tracking_mask.any():
+        ax.plot(ts[tracking_mask], errors[tracking_mask], "g-",
+                linewidth=1.2, label="TRACKING")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Error (m)")
     ax.set_title("Localization Error")
     ax.set_ylim(bottom=0)
+    ax.legend()
 
-    # 3. ESS and spread
+    # 3. Altitude vs time
+    ax = axes[0, 2]
+    ax.plot(ts, alts, "c-", linewidth=0.8)
+    ax.axhline(50.0, color="orange", linestyle="--", linewidth=0.8, label="50m gate")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Altitude (m)")
+    ax.set_title("Altitude")
+    ax.legend()
+
+    # 4. ESS and spread
     ax = axes[1, 0]
     ax.plot(ts, ess, "g-", linewidth=0.8, label="ESS")
     ax.set_xlabel("Time (s)")
@@ -421,7 +743,7 @@ def _generate_plot(results: list, output_path: str, t_start: int):
     ax2.set_ylabel("Spread (m)", color="m")
     ax.set_title("ESS & Spread")
 
-    # 4. State timeline
+    # 5. State timeline
     ax = axes[1, 1]
     state_map = {"UNINIT": 0, "DISPERSED": 1, "CONVERGING": 2, "TRACKING": 3}
     state_vals = [state_map.get(s, 0) for s in states]
@@ -431,7 +753,24 @@ def _generate_plot(results: list, output_path: str, t_start: int):
     ax.set_xlabel("Time (s)")
     ax.set_title("Phase Timeline")
 
+    # 6. Error CDF (tracking only)
+    ax = axes[1, 2]
+    track_errs = errors[tracking_mask]
+    if len(track_errs) > 0:
+        sorted_e = np.sort(track_errs)
+        cdf = np.arange(1, len(sorted_e) + 1) / len(sorted_e)
+        ax.plot(sorted_e, cdf * 100, "g-", linewidth=1.5)
+        ax.axvline(float(np.median(sorted_e)), color="r", linestyle="--",
+                   linewidth=0.8, label=f"median={np.median(sorted_e):.1f}m")
+        ax.axvline(float(np.percentile(sorted_e, 90)), color="orange", linestyle="--",
+                   linewidth=0.8, label=f"p90={np.percentile(sorted_e, 90):.1f}m")
+        ax.legend(fontsize=8)
+    ax.set_xlabel("Error (m)")
+    ax.set_ylabel("CDF (%)")
+    ax.set_title("Error CDF (TRACKING)")
+
     plt.tight_layout()
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=150)
     plt.close()
 
@@ -444,5 +783,21 @@ if __name__ == "__main__":
                         help="Show live OpenCV debug window")
     parser.add_argument("--save-frames", action="store_true",
                         help="Save debug frames as JPEGs to results/debug_frames/")
+    parser.add_argument("--save-cache", action="store_true",
+                        help="Save match cache to results/<bag_name>/match_cache.pkl")
+    parser.add_argument("--use-cache", metavar="PATH",
+                        help="Replay PF from match cache (no TRT, no MCAP)")
+    parser.add_argument("--altitude-min", type=float, default=None,
+                        help="Override altitude_min_process_m from config")
+    parser.add_argument("--max-frames", type=int, default=None,
+                        help="Stop after N camera frames (debug)")
     args = parser.parse_args()
-    run_replay(args.config, show_window=args.show, save_frames=args.save_frames)
+    run_replay(
+        args.config,
+        show_window=args.show,
+        save_frames=args.save_frames,
+        save_cache=args.save_cache,
+        cache_path=args.use_cache,
+        altitude_min_override=args.altitude_min,
+        max_frames=args.max_frames,
+    )
