@@ -37,6 +37,14 @@ particle_filter:
   altitude_sigma_scale: 0.5
   # Fine match consistency gate (0 = disabled)
   fine_consistency_max_m: 50.0     # reject fine matches > 50m from PF estimate
+  fine_force_inliers: 0             # disabled
+  # Trust gating thresholds
+  trust_recon_sim_min: 0.15        # min reconstructed sim to trust mosaic/satellite fine
+  trust_coarse_sim_min: 0.3        # min coarse top-1 sim to trust top-1 fine
+  trust_high_inliers: 20           # inliers above this bypass sim gates
+  trust_cross_agree_m: 30.0        # mosaic vs top-1 agreement distance (m)
+  trust_drift_recon_sim: 0.3       # below this + disagreement → drift detected
+  trust_drift_coarse_sim: 0.4      # above this + disagreement → trust coarse over mosaic
   # Strong coarse trust: if top-1 sim > threshold, teleport particles there
   # Set to 0.0 to disable
   coarse_trust_sim: 0.4
@@ -80,7 +88,7 @@ init:
   lock_sim_threshold: 0.3  # minimum sim to count as a hit
 
 replay:
-  mcap_path: "/media/aniel/storage/bags_jetson/095c6d2c7237fe986c6240628b6ef8dd/Day2.6_0.mcap"
+  mcap_path: "/media/aniel/storage/bags_jetson/1f24cb6af4e6fea2d9d31829715aad95/Day3.1_0.mcap"
   camera_topic: "/camera/image_mono"
   rtk_topic: "/m300/rtk/fix"
   yaw_topic: "/m300/rtk/yaw"

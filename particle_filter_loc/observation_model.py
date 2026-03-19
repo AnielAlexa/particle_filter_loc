@@ -196,6 +196,14 @@ class ObservationModel:
         top_names = [self.patch_names[i] for i in top_indices]
         return CoarseResult(top_k_names=top_names, top_k_sims=top_sims, top_k_indices=top_indices)
 
+    def compute_similarity(self, img_a: np.ndarray, img_b: np.ndarray) -> float:
+        """Cosine similarity between two images using the coarse descriptor extractor."""
+        t_a = self.extractor.preprocess(img_a)
+        t_b = self.extractor.preprocess(img_b)
+        d_a = F.normalize(self.extractor(t_a).float(), dim=1)
+        d_b = F.normalize(self.extractor(t_b).float(), dim=1)
+        return float((d_a @ d_b.T).squeeze())
+
     # ------------------------------------------------------------------
     # Fine matching
     # ------------------------------------------------------------------

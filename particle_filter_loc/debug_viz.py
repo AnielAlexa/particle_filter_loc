@@ -393,7 +393,7 @@ class DebugVisualizer:
 
         # Particle scatter
         p_part = _blank()
-        if pf.particles is not None and len(pf.particles) > 0:
+        if pf.particles is not None and len(pf.particles) > 0 and not np.any(np.isnan(pf.particles)):
             pts_e = pf.particles[:, 0]
             pts_n = pf.particles[:, 1]
             pad = max(pf.weighted_spread() * 3.0, 30.0)

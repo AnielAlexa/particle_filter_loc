@@ -47,6 +47,9 @@ class PFConfig:
     # Prevents visually-ambiguous patches from jumping the PF across the map.
     # Set to 0.0 to disable (always accept fine).
     fine_consistency_max_m: float = 0.0
+    # High-inlier override: if inliers exceed this, bypass consistency gate
+    # and recenter particles on the fine match position. Set to 0 to disable.
+    fine_force_inliers: int = 0
     # Strong coarse trust: when top-1 sim exceeds this threshold, teleport most
     # particles to the matched patch center.  Set to 0.0 to disable.
     coarse_trust_sim: float = 0.0
@@ -242,6 +245,9 @@ class ParticleFilter:
         Returns True if update was applied, False if rejected by consistency gate.
         """
         if self.particles is None:
+            return False
+
+        if math.isnan(fine_east) or math.isnan(fine_north):
             return False
 
         # Consistency gate: reject if fine match is too far from current estimate

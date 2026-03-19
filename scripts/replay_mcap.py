@@ -67,7 +67,18 @@ def run_replay(
 
     # PF config
     pf_cfg_dict = cfg["particle_filter"]
-    pf_config = _build_pf_config(pf_cfg_dict)
+
+    # Trust thresholds (extract before building PFConfig)
+    _trust_keys = {"trust_recon_sim_min", "trust_coarse_sim_min", "trust_high_inliers",
+                   "trust_cross_agree_m", "trust_drift_recon_sim", "trust_drift_coarse_sim"}
+    trust_recon_min     = pf_cfg_dict.get("trust_recon_sim_min", 0.15)
+    trust_coarse_min    = pf_cfg_dict.get("trust_coarse_sim_min", 0.3)
+    trust_high_inliers  = pf_cfg_dict.get("trust_high_inliers", 20)
+    trust_cross_agree   = pf_cfg_dict.get("trust_cross_agree_m", 30.0)
+    trust_drift_recon   = pf_cfg_dict.get("trust_drift_recon_sim", 0.3)
+    trust_drift_coarse  = pf_cfg_dict.get("trust_drift_coarse_sim", 0.4)
+
+    pf_config = _build_pf_config({k: v for k, v in pf_cfg_dict.items() if k not in _trust_keys})
 
     # Replay config
     rcfg = cfg["replay"]
@@ -388,14 +399,18 @@ def run_replay(
                     output_size=(320, 320),
                 )
 
-            # Satellite footprint viz (from same reconstruction)
+            # --- Trust: coarse sims + reconstructed similarity ---
             top1_sim = coarse.top_k_sims[0] if coarse.top_k_sims else 0.0
+            top2_sim = coarse.top_k_sims[1] if len(coarse.top_k_sims) > 1 else 0.0
+            coarse_gap = top1_sim - top2_sim
+            recon_sim = 0.0
             if fp_recon is not None:
+                recon_sim = obs.compute_similarity(frame_bgr, fp_recon.satellite_crop)
                 viz.satellite_footprint = fp_recon.satellite_crop
-                viz.footprint_confidence = top1_sim
+                viz.footprint_confidence = recon_sim
                 viz.footprint_info_str = (
                     f"{fp_recon.footprint_w_m:.0f}x{fp_recon.footprint_h_m:.0f}m "
-                    f"sim={top1_sim:.2f}"
+                    f"csim={top1_sim:.2f} rsim={recon_sim:.2f}"
                 )
             else:
                 viz.satellite_footprint = None
@@ -436,7 +451,6 @@ def run_replay(
                                                context_fraction=ctx_frac)
 
                 # Store results for visualization
-                # Mosaic panel shows best of satellite/mosaic
                 best_mosaic = None
                 if sat_fine is not None and mosaic_fine is not None:
                     best_mosaic = sat_fine if sat_fine.inliers >= mosaic_fine.inliers else mosaic_fine
@@ -446,7 +460,6 @@ def run_replay(
                     best_mosaic = mosaic_fine
 
                 if best_mosaic is not None and fp_recon is not None:
-                    # Show satellite crop in viz if satellite won, else rotated mosaic
                     if best_mosaic.patch_name == "satellite":
                         viz.mosaic_ref_img = fp_recon.satellite_crop
                     else:
@@ -465,25 +478,68 @@ def run_replay(
                     viz.top1_fine_method = patch_fine.method
                     viz.top1_fine_inliers = patch_fine.inliers
 
-                # Pick the best across all three for PF update
+                # --- Trust-gated fine update ---
+                # Decide which fine results to trust
+                trust_mosaic = recon_sim >= trust_recon_min
+                trust_coarse = top1_sim >= trust_coarse_min
+
                 fine_candidates = []
+
+                # High-inlier override: >20 inliers is strong geometric evidence
+                # regardless of sim scores
+                all_fine = []
                 if sat_fine is not None:
-                    fine_candidates.append((sat_fine, "satellite"))
+                    all_fine.append((sat_fine, "satellite"))
                 if mosaic_fine is not None:
-                    fine_candidates.append((mosaic_fine, "mosaic"))
+                    all_fine.append((mosaic_fine, "mosaic"))
                 if patch_fine is not None:
+                    all_fine.append((patch_fine, coarse.top_k_names[0]))
+
+                for result, source in all_fine:
+                    if result.inliers > trust_high_inliers:
+                        fine_candidates.append((result, source))
+
+                # Normal trust gating for results not already added
+                added = {s for _, s in fine_candidates}
+
+                # Mosaic/satellite fine: trust only if reconstructed sim >= 0.15
+                if trust_mosaic:
+                    if sat_fine is not None and "satellite" not in added:
+                        fine_candidates.append((sat_fine, "satellite"))
+                    if mosaic_fine is not None and "mosaic" not in added:
+                        fine_candidates.append((mosaic_fine, "mosaic"))
+
+                # Top-1 patch fine: trust if coarse sim >= 0.3
+                if trust_coarse and patch_fine is not None and coarse.top_k_names[0] not in added:
                     fine_candidates.append((patch_fine, coarse.top_k_names[0]))
+
+                # Cross-validation: if mosaic and top-1 both exist, check agreement
+                if fine_candidates and best_mosaic is not None and patch_fine is not None:
+                    mosaic_e, mosaic_n = enu.wgs84_to_enu(best_mosaic.lat, best_mosaic.lon)
+                    patch_e, patch_n = enu.wgs84_to_enu(patch_fine.lat, patch_fine.lon)
+                    cross_dist = np.sqrt((mosaic_e - patch_e)**2 + (mosaic_n - patch_n)**2)
+                    if cross_dist < trust_cross_agree:
+                        # Sources agree — boost confidence, prefer the one with more inliers
+                        pass
+                    elif recon_sim < trust_drift_recon and top1_sim >= trust_drift_coarse:
+                        # Disagreement + low recon sim + high coarse → PF drifted
+                        # Drop mosaic candidates, keep only top-1
+                        fine_candidates = [(r, s) for r, s in fine_candidates
+                                           if s not in ("satellite", "mosaic")]
 
                 if fine_candidates:
                     fine_result, fine_source = max(fine_candidates, key=lambda x: x[0].inliers)
                     viz.fine_matched_name = fine_source
+                else:
+                    # No trusted candidates
+                    viz.fine_matched_name = "NO_TRUST"
 
                 if fine_result is not None:
                     fe, fn = enu.wgs84_to_enu(fine_result.lat, fine_result.lon)
                     accepted = pf.update_fine(fe, fn, fine_result.inliers, fine_result.heading_deg)
                     if accepted:
                         fine_succeeded += 1
-                        viz.footprint_confidence = min(1.0, top1_sim + 0.1 * fine_result.inliers / 20.0)
+                        viz.footprint_confidence = recon_sim
                     else:
                         viz.fine_matched_name = "REJECTED"
 
