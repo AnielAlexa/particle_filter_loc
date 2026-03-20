@@ -27,6 +27,7 @@ from particle_filter_loc.particle_filter import PFConfig, ParticleFilter, Phase
 from particle_filter_loc.observation_model import ObservationModel
 from particle_filter_loc.debug_viz import DebugVisualizer
 from particle_filter_loc.footprint_reconstruction import SatelliteFootprintReconstructor
+from particle_filter_loc.trust_model import TrustConfig, TrustTracker, evaluate_coarse_trust
 
 
 def load_config(config_path: str) -> dict:
@@ -68,15 +69,14 @@ def run_replay(
     # PF config
     pf_cfg_dict = cfg["particle_filter"]
 
-    # Trust thresholds (extract before building PFConfig)
+    # Trust config
     _trust_keys = {"trust_recon_sim_min", "trust_coarse_sim_min", "trust_high_inliers",
-                   "trust_cross_agree_m", "trust_drift_recon_sim", "trust_drift_coarse_sim"}
-    trust_recon_min     = pf_cfg_dict.get("trust_recon_sim_min", 0.15)
-    trust_coarse_min    = pf_cfg_dict.get("trust_coarse_sim_min", 0.3)
-    trust_high_inliers  = pf_cfg_dict.get("trust_high_inliers", 20)
-    trust_cross_agree   = pf_cfg_dict.get("trust_cross_agree_m", 30.0)
-    trust_drift_recon   = pf_cfg_dict.get("trust_drift_recon_sim", 0.3)
-    trust_drift_coarse  = pf_cfg_dict.get("trust_drift_coarse_sim", 0.4)
+                   "trust_cross_agree_m", "trust_drift_recon_sim", "trust_drift_coarse_sim",
+                   "coarse_trust_sim", "coarse_trust_fraction", "coarse_trust_sigma"}
+    trust_cfg_dict = cfg.get("trust", {})
+    # Handle coarse_teleport_sigma_range as list
+    trust_config = TrustConfig(**trust_cfg_dict)
+    trust_tracker = TrustTracker(trust_config)
 
     pf_config = _build_pf_config({k: v for k, v in pf_cfg_dict.items() if k not in _trust_keys})
 
@@ -115,6 +115,7 @@ def run_replay(
         return _replay_from_cache(
             cache_path=cache_path,
             pf_config=pf_config,
+            trust_config=trust_config,
             lock_cfg=cfg.get("init", {}),
             altitude_min_m=altitude_min_m,
             output_csv=str(output_csv),
@@ -383,19 +384,31 @@ def run_replay(
 
             pf.update_coarse(coarse_obs, altitude_m=current_altitude_m)
 
-            # Strong trust: if top-1 sim is high, teleport particles there
-            # Skip when RTK-initialized — let PF evolve smoothly via fine matching
+            # Continuous coarse trust teleport (skip when RTK-initialized)
             if coarse_obs and not rtk_init:
                 top_e, top_n, top_sim = coarse_obs[0]
-                pf.inject_coarse_trust(top_e, top_n, top_sim)
+                coarse_decision = evaluate_coarse_trust(
+                    top_sim, pf.weighted_spread(),
+                    trust_tracker.recon_sim_ema, trust_config,
+                )
+                if coarse_decision is not None:
+                    tp_frac, tp_sigma = coarse_decision
+                    pf.inject_coarse_trust(
+                        top_e, top_n, top_sim,
+                        teleport_fraction_override=tp_frac,
+                        teleport_sigma_override=tp_sigma,
+                    )
 
             # --- Reconstruct satellite mosaic (single call for fine matching + viz) ---
             fp_recon = None
             if est_lat_prev is not None:
+                # Use the center-crop square size so satellite_crop matches the drone
+                # image (which is center-cropped from cam_w×cam_h → crop×crop → 320×320)
+                cam_crop = min(cam_w, cam_h)
                 fp_recon = reconstructor.reconstruct(
                     est_lat_prev, est_lon_prev, current_altitude_m,
                     est_hdg_prev + heading_offset_deg,
-                    cam_fx, cam_fy, cam_w, cam_h,
+                    cam_fx, cam_fy, cam_crop, cam_crop,
                     output_size=(320, 320),
                 )
 
@@ -416,12 +429,14 @@ def run_replay(
                 viz.satellite_footprint = None
 
             # --- Fine match (adaptive) ---
+            frame_trust = None
             fine_result = None
             sat_fine = None
             mosaic_fine = None
             patch_fine = None
             if pf.should_run_fine():
                 fine_attempted += 1
+                obs.altitude_m = current_altitude_m  # keep PnP altitude init accurate
 
                 # A) Fine match on satellite crop (perspective-warped to drone FOV)
                 if (fp_recon is not None and fp_recon.warp_M_inv is not None):
@@ -478,70 +493,56 @@ def run_replay(
                     viz.top1_fine_method = patch_fine.method
                     viz.top1_fine_inliers = patch_fine.inliers
 
-                # --- Trust-gated fine update ---
-                # Decide which fine results to trust
-                trust_mosaic = recon_sim >= trust_recon_min
-                trust_coarse = top1_sim >= trust_coarse_min
-
-                fine_candidates = []
-
-                # High-inlier override: >20 inliers is strong geometric evidence
-                # regardless of sim scores
+                # --- Unified trust-gated fine update ---
                 all_fine = []
                 if sat_fine is not None:
-                    all_fine.append((sat_fine, "satellite"))
+                    fe_s, fn_s = enu.wgs84_to_enu(sat_fine.lat, sat_fine.lon)
+                    if np.isfinite(fe_s) and np.isfinite(fn_s):
+                        all_fine.append((fe_s, fn_s, sat_fine.inliers,
+                                        sat_fine.heading_deg, "satellite"))
                 if mosaic_fine is not None:
-                    all_fine.append((mosaic_fine, "mosaic"))
+                    fe_m, fn_m = enu.wgs84_to_enu(mosaic_fine.lat, mosaic_fine.lon)
+                    if np.isfinite(fe_m) and np.isfinite(fn_m):
+                        all_fine.append((fe_m, fn_m, mosaic_fine.inliers,
+                                        mosaic_fine.heading_deg, "mosaic"))
                 if patch_fine is not None:
-                    all_fine.append((patch_fine, coarse.top_k_names[0]))
+                    fe_p, fn_p = enu.wgs84_to_enu(patch_fine.lat, patch_fine.lon)
+                    if np.isfinite(fe_p) and np.isfinite(fn_p):
+                        all_fine.append((fe_p, fn_p, patch_fine.inliers,
+                                        patch_fine.heading_deg, coarse.top_k_names[0]))
 
-                for result, source in all_fine:
-                    if result.inliers > trust_high_inliers:
-                        fine_candidates.append((result, source))
+                frame_trust = trust_tracker.evaluate_frame(
+                    fine_candidates=all_fine,
+                    recon_sim=recon_sim,
+                    top1_sim=top1_sim,
+                    pf_east=est_e, pf_north=est_n,
+                    pf_spread=pf.weighted_spread(),
+                    lost_spread=pf_config.lost_spread_m,
+                    altitude_m=current_altitude_m,
+                    timestamp_s=elapsed_s,
+                )
 
-                # Normal trust gating for results not already added
-                added = {s for _, s in fine_candidates}
+                if frame_trust.best is not None:
+                    best_cs = frame_trust.best
+                    fine_result = best_cs  # for logging below
+                    eff_sigma = trust_tracker.get_effective_sigma(
+                        best_cs.confidence, pf_config.sigma_obs_fine)
+                    eff_kappa = trust_tracker.get_effective_kappa(best_cs.confidence)
+                    viz.fine_matched_name = best_cs.source
+                    viz.footprint_confidence = best_cs.confidence
 
-                # Mosaic/satellite fine: trust only if reconstructed sim >= 0.15
-                if trust_mosaic:
-                    if sat_fine is not None and "satellite" not in added:
-                        fine_candidates.append((sat_fine, "satellite"))
-                    if mosaic_fine is not None and "mosaic" not in added:
-                        fine_candidates.append((mosaic_fine, "mosaic"))
-
-                # Top-1 patch fine: trust if coarse sim >= 0.3
-                if trust_coarse and patch_fine is not None and coarse.top_k_names[0] not in added:
-                    fine_candidates.append((patch_fine, coarse.top_k_names[0]))
-
-                # Cross-validation: if mosaic and top-1 both exist, check agreement
-                if fine_candidates and best_mosaic is not None and patch_fine is not None:
-                    mosaic_e, mosaic_n = enu.wgs84_to_enu(best_mosaic.lat, best_mosaic.lon)
-                    patch_e, patch_n = enu.wgs84_to_enu(patch_fine.lat, patch_fine.lon)
-                    cross_dist = np.sqrt((mosaic_e - patch_e)**2 + (mosaic_n - patch_n)**2)
-                    if cross_dist < trust_cross_agree:
-                        # Sources agree — boost confidence, prefer the one with more inliers
-                        pass
-                    elif recon_sim < trust_drift_recon and top1_sim >= trust_drift_coarse:
-                        # Disagreement + low recon sim + high coarse → PF drifted
-                        # Drop mosaic candidates, keep only top-1
-                        fine_candidates = [(r, s) for r, s in fine_candidates
-                                           if s not in ("satellite", "mosaic")]
-
-                if fine_candidates:
-                    fine_result, fine_source = max(fine_candidates, key=lambda x: x[0].inliers)
-                    viz.fine_matched_name = fine_source
-                else:
-                    # No trusted candidates
-                    viz.fine_matched_name = "NO_TRUST"
-
-                if fine_result is not None:
-                    fe, fn = enu.wgs84_to_enu(fine_result.lat, fine_result.lon)
-                    accepted = pf.update_fine(fe, fn, fine_result.inliers, fine_result.heading_deg)
+                    accepted = pf.update_fine(
+                        best_cs.east_m, best_cs.north_m, best_cs.inliers,
+                        best_cs.heading_deg,
+                        sigma_override=eff_sigma,
+                        kappa_override=eff_kappa,
+                    )
                     if accepted:
                         fine_succeeded += 1
-                        viz.footprint_confidence = recon_sim
                     else:
                         viz.fine_matched_name = "REJECTED"
+                else:
+                    viz.fine_matched_name = "NO_TRUST"
 
             # Resample + transitions
             pf.resample_if_needed()
@@ -569,6 +570,8 @@ def run_replay(
             viz.update(pf, frame_bgr, error_m=error_m, elapsed_s=elapsed_s_frame,
                        gt_east=gt_e, gt_north=gt_n)
 
+            # Extract trust info for logging
+            _best_cs = frame_trust.best if frame_trust else None
             results.append({
                 "timestamp_ns": ts_ns,
                 "est_lat": est_lat,
@@ -581,23 +584,70 @@ def run_replay(
                 "ess": ess,
                 "spread_m": spread,
                 "state": pf.phase.name,
-                "fine_method": fine_result.method if fine_result else "",
-                "fine_inliers": fine_result.inliers if fine_result else 0,
+                "fine_source": _best_cs.source if _best_cs else "",
+                "fine_inliers": _best_cs.inliers if _best_cs else 0,
+                "fine_confidence": _best_cs.confidence if _best_cs else 0.0,
+                "fine_sigma_scale": trust_tracker.get_sigma_scale(_best_cs.confidence) if _best_cs else 0.0,
+                "inlier_score": _best_cs.inlier_score if _best_cs else 0.0,
+                "sim_score": _best_cs.sim_score if _best_cs else 0.0,
+                "consistency_score": _best_cs.consistency_score if _best_cs else 0.0,
+                "agreement_score": _best_cs.agreement_score if _best_cs else 0.0,
+                "altitude_score": _best_cs.altitude_score if _best_cs else 0.0,
+                "temporal_score": _best_cs.temporal_score if _best_cs else 0.0,
+                "recon_sim": recon_sim,
+                "top1_sim": top1_sim,
+                "coarse_gap": coarse_gap,
+                "pf_self_confidence": trust_tracker.pf_self_confidence_ema if frame_trust else 0.0,
+                "drift_detected": frame_trust.drift_detected if frame_trust else False,
+                "n_fine_candidates": len(frame_trust.all_scores) if frame_trust else 0,
+                "recon_sim_ema": frame_trust.recon_sim_ema if frame_trust else 0.0,
             })
 
-            # Build cache frame
+            # Build cache frame (v2: includes all fine candidates + trust signals)
             if save_cache:
+                # Best fine result for backward compat
                 fine_cache = None
-                if fine_result is not None:
-                    fe_c, fn_c = enu.wgs84_to_enu(fine_result.lat, fine_result.lon)
+                if _best_cs is not None:
                     fine_cache = {
-                        "east_m": fe_c,
-                        "north_m": fn_c,
-                        "inliers": fine_result.inliers,
-                        "heading_deg": fine_result.heading_deg,
-                        "method": fine_result.method,
-                        "patch_name": fine_result.patch_name,
+                        "east_m": _best_cs.east_m,
+                        "north_m": _best_cs.north_m,
+                        "inliers": _best_cs.inliers,
+                        "heading_deg": _best_cs.heading_deg,
+                        "method": _best_cs.source,
+                        "patch_name": _best_cs.source,
                     }
+                # All fine candidates
+                all_fine_cache = []
+                if sat_fine is not None:
+                    _fe, _fn = enu.wgs84_to_enu(sat_fine.lat, sat_fine.lon)
+                    all_fine_cache.append({
+                        "east_m": _fe, "north_m": _fn,
+                        "inliers": sat_fine.inliers,
+                        "heading_deg": sat_fine.heading_deg,
+                        "method": sat_fine.method,
+                        "patch_name": sat_fine.patch_name,
+                        "source": "satellite",
+                    })
+                if mosaic_fine is not None:
+                    _fe, _fn = enu.wgs84_to_enu(mosaic_fine.lat, mosaic_fine.lon)
+                    all_fine_cache.append({
+                        "east_m": _fe, "north_m": _fn,
+                        "inliers": mosaic_fine.inliers,
+                        "heading_deg": mosaic_fine.heading_deg,
+                        "method": mosaic_fine.method,
+                        "patch_name": mosaic_fine.patch_name,
+                        "source": "mosaic",
+                    })
+                if patch_fine is not None:
+                    _fe, _fn = enu.wgs84_to_enu(patch_fine.lat, patch_fine.lon)
+                    all_fine_cache.append({
+                        "east_m": _fe, "north_m": _fn,
+                        "inliers": patch_fine.inliers,
+                        "heading_deg": patch_fine.heading_deg,
+                        "method": patch_fine.method,
+                        "patch_name": patch_fine.patch_name,
+                        "source": coarse.top_k_names[0],
+                    })
                 cache_frames.append({
                     "timestamp_ns": ts_ns,
                     "elapsed_s": elapsed_s_frame,
@@ -609,6 +659,10 @@ def run_replay(
                     "coarse_top_k_sims":  list(coarse.top_k_sims),
                     "coarse_top_k_enu":   coarse_top_k_enu,
                     "fine_result": fine_cache,
+                    "all_fine_results": all_fine_cache,
+                    "recon_sim": recon_sim,
+                    "top1_sim": top1_sim,
+                    "coarse_gap": coarse_gap,
                     "rtk_deltas": _pending_rtk_deltas,
                 })
 
@@ -639,7 +693,7 @@ def run_replay(
     # ---- Write cache ----
     if save_cache and cache_frames:
         header = {
-            "__cache_version__": 1,
+            "__cache_version__": 2,
             "bag_name": bag_name,
             "mcap_path": mcap_path,
             "start_offset_s": start_offset_s,
@@ -663,6 +717,7 @@ def run_replay(
 def _replay_from_cache(
     cache_path: str,
     pf_config: PFConfig,
+    trust_config: TrustConfig,
     lock_cfg: dict,
     altitude_min_m: float,
     output_csv: str,
@@ -677,17 +732,16 @@ def _replay_from_cache(
     cache_frames = payload[1:]
     bag_name = header.get("bag_name", Path(cache_path).parent.name)
     enu = ENUFrame(header["enu_origin"]["lat"], header["enu_origin"]["lon"])
+    cache_version = header.get("__cache_version__", 1)
 
-    print(f"[{bag_name}|cache] {len(cache_frames)} frames  "
+    print(f"[{bag_name}|cache] {len(cache_frames)} frames  v={cache_version}  "
           f"(created {header.get('created_at', '?')})")
-
-    # Warn if matchers config has changed (cache may be stale)
-    # (caller can check; we just print)
 
     lock_n_frames   = lock_cfg.get("lock_n_frames", 4)
     lock_sim_thresh = lock_cfg.get("lock_sim_threshold", 0.40)
 
     pf = ParticleFilter(pf_config, rng_seed=42)
+    trust_tracker = TrustTracker(trust_config)
     results = []
     initialized = False
     tracking_start_ts = None
@@ -704,7 +758,7 @@ def _replay_from_cache(
         gt_lon  = frame["gt_lon"]
         elapsed = frame.get("elapsed_s", (ts_ns - t_start_ns) * 1e-9)
 
-        # Apply RTK deltas (even for gated frames — drone moved)
+        # Apply RTK deltas (even for gated frames)
         for d in frame.get("rtk_deltas", []):
             if pf.particles is not None:
                 pf.predict(MotionDelta(**d))
@@ -712,7 +766,6 @@ def _replay_from_cache(
         if frame.get("gated_out"):
             continue
 
-        # Altitude gating (may differ from cache's original gating if config changed)
         if altitude_min_m > 0.0 and alt < altitude_min_m:
             continue
 
@@ -741,8 +794,7 @@ def _replay_from_cache(
 
             if _lock_count >= lock_n_frames and len(_lock_sims) >= lock_n_frames:
                 tight_sigma = pf_config.sigma_obs_coarse / np.sqrt(_lock_count)
-                centers_enu = [c for c in coarse_enu]
-                pf.seed_from_coarse(centers_enu, coarse_sims, sigma_override=tight_sigma)
+                pf.seed_from_coarse(coarse_enu, coarse_sims, sigma_override=tight_sigma)
                 print(f"  [{bag_name}|cache] PF seeded: sigma={tight_sigma:.1f}m")
             continue
 
@@ -751,17 +803,72 @@ def _replay_from_cache(
         if coarse_obs:
             pf.update_coarse(coarse_obs, altitude_m=alt)
 
-        # Fine update (use cache's fine result if PF decides to run fine this frame)
-        fine_cache = frame.get("fine_result")
+        # Coarse trust teleport
+        if coarse_obs:
+            top1_sim_val = coarse_sims[0] if coarse_sims else 0.0
+            coarse_decision = evaluate_coarse_trust(
+                top1_sim_val, pf.weighted_spread(),
+                trust_tracker.recon_sim_ema, trust_config,
+            )
+            if coarse_decision is not None:
+                tp_frac, tp_sigma = coarse_decision
+                top_e, top_n_coord = coarse_enu[0]
+                pf.inject_coarse_trust(
+                    top_e, top_n_coord, top1_sim_val,
+                    teleport_fraction_override=tp_frac,
+                    teleport_sigma_override=tp_sigma,
+                )
+
+        # Fine update with trust model
         run_fine = pf.should_run_fine()
-        if fine_cache and run_fine:
-            fine_attempted += 1
-            fe = fine_cache["east_m"]
-            fn = fine_cache["north_m"]
-            pf.update_fine(fe, fn, fine_cache["inliers"], fine_cache.get("heading_deg"))
-            fine_succeeded += 1
-        elif run_fine:
-            fine_attempted += 1
+        if run_fine:
+            # Build candidates from cache
+            all_fine_cached = frame.get("all_fine_results", [])
+            recon_sim = frame.get("recon_sim", 0.0)
+            top1_sim_val = frame.get("top1_sim", coarse_sims[0] if coarse_sims else 0.0)
+
+            fine_candidates = []
+            for fr in all_fine_cached:
+                fine_candidates.append((
+                    fr["east_m"], fr["north_m"], fr["inliers"],
+                    fr.get("heading_deg"), fr.get("source", fr.get("patch_name", "")),
+                ))
+
+            # Fallback for v1 caches
+            if not fine_candidates:
+                fc = frame.get("fine_result")
+                if fc:
+                    fine_candidates.append((
+                        fc["east_m"], fc["north_m"], fc["inliers"],
+                        fc.get("heading_deg"), fc.get("method", ""),
+                    ))
+
+            if fine_candidates:
+                fine_attempted += 1
+                est_e, est_n, _ = pf.estimate()
+                ft = trust_tracker.evaluate_frame(
+                    fine_candidates=fine_candidates,
+                    recon_sim=recon_sim,
+                    top1_sim=top1_sim_val,
+                    pf_east=est_e, pf_north=est_n,
+                    pf_spread=pf.weighted_spread(),
+                    lost_spread=pf_config.lost_spread_m,
+                    altitude_m=alt,
+                    timestamp_s=elapsed,
+                )
+                if ft.best is not None:
+                    eff_sigma = trust_tracker.get_effective_sigma(
+                        ft.best.confidence, pf_config.sigma_obs_fine)
+                    eff_kappa = trust_tracker.get_effective_kappa(ft.best.confidence)
+                    pf.update_fine(
+                        ft.best.east_m, ft.best.north_m, ft.best.inliers,
+                        ft.best.heading_deg,
+                        sigma_override=eff_sigma,
+                        kappa_override=eff_kappa,
+                    )
+                    fine_succeeded += 1
+            else:
+                fine_attempted += 1
 
         pf.resample_if_needed()
         pf.check_transitions()
@@ -787,8 +894,8 @@ def _replay_from_cache(
             "ess": ess,
             "spread_m": spread,
             "state": pf.phase.name,
-            "fine_method": "",
-            "fine_inliers": fine_cache.get("inliers", 0) if fine_cache else 0,
+            "fine_source": "",
+            "fine_inliers": 0,
         })
 
     return _finalize_results(results, output_csv, output_plot, t_start_ns,

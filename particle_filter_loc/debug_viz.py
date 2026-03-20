@@ -77,11 +77,12 @@ def _build_match_panel(
         ref_w = ref_img.shape[1] if ref_img is not None else _SZ
         sx_r = _SZ / ref_w
         sy_r = _SZ / ref_h
+        n_draw = min(len(mkpts_drone), len(mkpts_ref), 80)
 
-        # Draw keypoints
-        for pt in mkpts_drone:
+        # Draw keypoints only for pairs that will have lines
+        for pt in mkpts_drone[:n_draw]:
             cv2.circle(p_drone, (int(pt[0]), int(pt[1])), 2, (0, 255, 0), -1, cv2.LINE_AA)
-        for pt in mkpts_ref:
+        for pt in mkpts_ref[:n_draw]:
             cv2.circle(p_ref, (int(pt[0] * sx_r), int(pt[1] * sy_r)), 2, (0, 100, 255), -1, cv2.LINE_AA)
 
     # Combine side by side
@@ -89,7 +90,6 @@ def _build_match_panel(
 
     # Draw match lines across the two halves
     if has_matches:
-        n_draw = min(len(mkpts_drone), 60)
         for i in range(n_draw):
             px_d = int(mkpts_drone[i, 0])
             py_d = int(mkpts_drone[i, 1])

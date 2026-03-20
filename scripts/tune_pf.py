@@ -34,6 +34,7 @@ sys.path.insert(0, str(PKG_DIR))
 from particle_filter_loc.geo_utils import ENUFrame, haversine_m
 from particle_filter_loc.motion_model import MotionDelta
 from particle_filter_loc.particle_filter import PFConfig, ParticleFilter, Phase
+from particle_filter_loc.trust_model import TrustConfig, TrustTracker, evaluate_coarse_trust
 
 
 # ---------------------------------------------------------------------------
@@ -48,8 +49,13 @@ GRID = {
     "fine_consistency_max_m":[0.0, 50.0, 100.0, 150.0],
 }
 # Total: 5×3×3×3×3×4 = 1620 combos.
-# Run on working bags only (Day3.1, Day4.2, Day4.3) — bags with no tracking
-# (Day3.2, Day3.3) dominate the metric with 9999m sentinel and are excluded.
+
+# Trust params to optionally sweep (extend GRID to include these)
+TRUST_GRID = {
+    "inlier_tau":    [15.0, 25.0, 40.0],
+    "ema_alpha":     [0.2, 0.3, 0.5],
+    "min_confidence": [0.03, 0.05, 0.10],
+}
 
 
 def _load_cache(path: str):
@@ -59,8 +65,9 @@ def _load_cache(path: str):
     header = payload[0]
     frames = payload[1:]
     enu = ENUFrame(header["enu_origin"]["lat"], header["enu_origin"]["lon"])
+    version = header.get("__cache_version__", 1)
     print(f"  Loaded {Path(path).name}: {len(frames)} frames  "
-          f"bag={header.get('bag_name','?')}  "
+          f"bag={header.get('bag_name','?')}  v={version}  "
           f"created={header.get('created_at','?')[:10]}")
     return header, frames, enu
 
@@ -69,6 +76,7 @@ def pf_replay_from_cache(
     frames: list,
     enu: ENUFrame,
     pf_config: PFConfig,
+    trust_config: Optional[TrustConfig] = None,
     lock_n_frames: int = 4,
     lock_sim_thresh: float = 0.40,
     altitude_min_m: float = 50.0,
@@ -76,11 +84,13 @@ def pf_replay_from_cache(
 ) -> dict:
     """Pure-PF replay from cached match data. Returns summary dict.
 
-    Uses rng_seed=42 by default for reproducibility across grid search.
-    All motion predict steps are applied even for gated frames so the
-    motion model stays coherent.
+    When trust_config is provided, uses the unified trust model for fine
+    update gating.  Requires v2 caches (with all_fine_results, recon_sim,
+    top1_sim fields).  Falls back to legacy single-result mode for v1 caches.
     """
     pf = ParticleFilter(pf_config, rng_seed=rng_seed)
+    trust_tracker = TrustTracker(trust_config) if trust_config else None
+
     results = []
     initialized = False
     tracking_start_ns = None
@@ -95,6 +105,7 @@ def pf_replay_from_cache(
         alt    = frame.get("altitude_m", 0.0)
         gt_lat = frame.get("gt_lat", 0.0)
         gt_lon = frame.get("gt_lon", 0.0)
+        elapsed_s = frame.get("elapsed_s", (ts_ns - t_start_ns) * 1e-9)
 
         # Apply RTK deltas for motion continuity (even for gated/uninit frames)
         for d in frame.get("rtk_deltas", []):
@@ -141,17 +152,85 @@ def pf_replay_from_cache(
         if coarse_obs:
             pf.update_coarse(coarse_obs, altitude_m=alt)
 
-        # Fine update — use cache result if PF decides to run fine this frame
-        fine_cache = frame.get("fine_result")
-        run_fine = pf.should_run_fine()  # has side effect: increments frame count
-        if fine_cache and run_fine:
-            fe = fine_cache["east_m"]
-            fn = fine_cache["north_m"]
-            pf.update_fine(fe, fn, fine_cache["inliers"], fine_cache.get("heading_deg"))
-            fine_attempted += 1
-            fine_succeeded += 1
+        # Coarse trust teleport (continuous)
+        if trust_tracker and coarse_obs:
+            top1_sim = coarse_sims[0] if coarse_sims else 0.0
+            coarse_decision = evaluate_coarse_trust(
+                top1_sim, pf.weighted_spread(),
+                trust_tracker.recon_sim_ema, trust_config,
+            )
+            if coarse_decision is not None:
+                tp_frac, tp_sigma = coarse_decision
+                top_e, top_n_coord = coarse_enu[0]
+                pf.inject_coarse_trust(
+                    top_e, top_n_coord, top1_sim,
+                    teleport_fraction_override=tp_frac,
+                    teleport_sigma_override=tp_sigma,
+                )
+
+        # Fine update
+        run_fine = pf.should_run_fine()
+
+        if run_fine and trust_tracker:
+            # v2 cache: use all_fine_results + trust model
+            all_fine_cached = frame.get("all_fine_results", [])
+            recon_sim = frame.get("recon_sim", 0.0)
+            top1_sim = frame.get("top1_sim", coarse_sims[0] if coarse_sims else 0.0)
+
+            # Build candidates list
+            fine_candidates = []
+            for fr in all_fine_cached:
+                fine_candidates.append((
+                    fr["east_m"], fr["north_m"], fr["inliers"],
+                    fr.get("heading_deg"), fr.get("source", fr.get("patch_name", "")),
+                ))
+
+            # Fallback: if no all_fine_results (v1 cache), use single fine_result
+            if not fine_candidates:
+                fc = frame.get("fine_result")
+                if fc:
+                    fine_candidates.append((
+                        fc["east_m"], fc["north_m"], fc["inliers"],
+                        fc.get("heading_deg"), fc.get("method", ""),
+                    ))
+
+            if fine_candidates:
+                fine_attempted += 1
+                est_e, est_n, _ = pf.estimate()
+                ft = trust_tracker.evaluate_frame(
+                    fine_candidates=fine_candidates,
+                    recon_sim=recon_sim,
+                    top1_sim=top1_sim,
+                    pf_east=est_e, pf_north=est_n,
+                    pf_spread=pf.weighted_spread(),
+                    lost_spread=pf_config.lost_spread_m,
+                    altitude_m=alt,
+                    timestamp_s=elapsed_s,
+                )
+                if ft.best is not None:
+                    eff_sigma = trust_tracker.get_effective_sigma(
+                        ft.best.confidence, pf_config.sigma_obs_fine)
+                    eff_kappa = trust_tracker.get_effective_kappa(ft.best.confidence)
+                    pf.update_fine(
+                        ft.best.east_m, ft.best.north_m, ft.best.inliers,
+                        ft.best.heading_deg,
+                        sigma_override=eff_sigma,
+                        kappa_override=eff_kappa,
+                    )
+                    fine_succeeded += 1
+            else:
+                fine_attempted += 1
+
         elif run_fine:
+            # Legacy path: no trust model
+            fine_cache = frame.get("fine_result")
             fine_attempted += 1
+            if fine_cache:
+                pf.update_fine(
+                    fine_cache["east_m"], fine_cache["north_m"],
+                    fine_cache["inliers"], fine_cache.get("heading_deg"),
+                )
+                fine_succeeded += 1
 
         pf.resample_if_needed()
         pf.check_transitions()
@@ -197,35 +276,55 @@ def _run_grid_search(
     caches: list,           # list of (header, frames, enu)
     base_pf_dict: dict,
     grid: dict,
+    trust_config: Optional[TrustConfig] = None,
+    trust_overrides: Optional[dict] = None,
     metric: str = "median_err_tracking",
     lock_n_frames: int = 4,
     lock_sim_thresh: float = 0.40,
     altitude_min_m: float = 50.0,
 ):
-    """Run grid search. Returns list of result dicts sorted by metric."""
+    """Run grid search. Returns list of result dicts sorted by metric.
+
+    trust_overrides: dict mapping trust param name -> value to override
+    in the TrustConfig for this combo (used when sweeping trust params).
+    """
     param_names = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in param_names]))
     n_total = len(combos) * len(caches)
-    print(f"\n[tune] Grid: {len(combos)} combos × {len(caches)} bags = {n_total} PF replays")
+    print(f"\n[tune] Grid: {len(combos)} combos x {len(caches)} bags = {n_total} PF replays")
     print(f"[tune] Sorting by: {metric}")
+
+    # Separate PF fields from trust fields
+    import dataclasses
+    pf_fields = {f.name for f in dataclasses.fields(PFConfig)}
+    trust_fields = {f.name for f in dataclasses.fields(TrustConfig)} if trust_config else set()
 
     all_results = []
     t0 = time.monotonic()
 
     for i, combo in enumerate(combos):
         params = dict(zip(param_names, combo))
-        pf_dict = {**base_pf_dict, **params}
+        pf_dict = {**base_pf_dict, **{k: v for k, v in params.items() if k in pf_fields}}
 
-        # PFConfig only accepts its own fields; filter out unknowns
-        import dataclasses
-        valid_fields = {f.name for f in dataclasses.fields(PFConfig)}
-        pf_dict_clean = {k: v for k, v in pf_dict.items() if k in valid_fields}
+        pf_dict_clean = {k: v for k, v in pf_dict.items() if k in pf_fields}
         pf_config = PFConfig(**pf_dict_clean)
+
+        # Build trust config with overrides from grid
+        tc = None
+        if trust_config:
+            trust_params = {k: v for k, v in params.items() if k in trust_fields}
+            if trust_overrides:
+                trust_params.update(trust_overrides)
+            if trust_params:
+                tc = dataclasses.replace(trust_config, **trust_params)
+            else:
+                tc = trust_config
 
         bag_summaries = []
         for header, frames, enu in caches:
             s = pf_replay_from_cache(
                 frames, enu, pf_config,
+                trust_config=tc,
                 lock_n_frames=lock_n_frames,
                 lock_sim_thresh=lock_sim_thresh,
                 altitude_min_m=altitude_min_m,
@@ -262,8 +361,8 @@ def _run_grid_search(
     return all_results
 
 
-def _print_top_results(results: list, top_n: int, metric: str):
-    param_names = list(GRID.keys())
+def _print_top_results(results: list, top_n: int, metric: str, grid: dict):
+    param_names = list(grid.keys())
     col_w = max(len(k) for k in param_names + ["metric_val"]) + 2
 
     print(f"\n{'='*80}")
@@ -288,7 +387,7 @@ def _print_top_results(results: list, top_n: int, metric: str):
     best = results[0]
     for k in param_names:
         print(f"  {k}: {best[k]}")
-    print(f"  → median_err_tracking = {best['median_err_tracking']:.2f}m  "
+    print(f"  -> median_err_tracking = {best['median_err_tracking']:.2f}m  "
           f"p90 = {best['p90_err_tracking']:.2f}m")
 
 
@@ -308,6 +407,8 @@ def main():
                         help="Number of top combos to display")
     parser.add_argument("--altitude-min", type=float, default=50.0,
                         help="Altitude threshold for frame gating (m)")
+    parser.add_argument("--sweep-trust", action="store_true",
+                        help="Also sweep trust model params (inlier_tau, ema_alpha, min_confidence)")
     args = parser.parse_args()
 
     # Load caches
@@ -315,7 +416,7 @@ def main():
     caches = []
     for p in args.caches:
         if not Path(p).exists():
-            print(f"  [WARN] Cache not found: {p} — skipping")
+            print(f"  [WARN] Cache not found: {p} -- skipping")
             continue
         caches.append(_load_cache(p))
 
@@ -323,19 +424,39 @@ def main():
         print("[tune] No caches loaded. Run replay_mcap.py --save-cache first.")
         return
 
-    # Load base PF config
+    # Load base config
     base_cfg = yaml.safe_load(open(args.base_config))
     base_pf_dict = base_cfg["particle_filter"]
     lock_cfg = base_cfg.get("init", {})
+    trust_cfg_dict = base_cfg.get("trust", {})
+    trust_config = TrustConfig(**trust_cfg_dict)
 
-    # Baseline run (current params, no grid)
+    # Check if caches have v2 data
+    first_header = caches[0][0]
+    cache_version = first_header.get("__cache_version__", 1)
+    if cache_version < 2:
+        print(f"[tune] WARNING: cache is v{cache_version}. Trust model works best with v2 caches.")
+        print("       Re-run replay_mcap.py --save-cache to generate v2 caches.")
+
+    # Build grid
+    grid = dict(GRID)
+    if args.sweep_trust:
+        grid.update(TRUST_GRID)
+        n_combos = 1
+        for v in grid.values():
+            n_combos *= len(v)
+        print(f"[tune] Trust sweep enabled: {n_combos} total combos")
+
+    # Baseline run (current params)
+    import dataclasses
     print("\n[tune] Baseline run with current pf_config.yaml...")
-    base_pf_config = PFConfig(**{k: v for k, v in base_pf_dict.items()
-                                  if k in {f.name for f in __import__('dataclasses').fields(PFConfig)}})
+    pf_fields = {f.name for f in dataclasses.fields(PFConfig)}
+    base_pf_config = PFConfig(**{k: v for k, v in base_pf_dict.items() if k in pf_fields})
     baseline_summaries = []
     for header, frames, enu in caches:
         s = pf_replay_from_cache(
             frames, enu, base_pf_config,
+            trust_config=trust_config,
             lock_n_frames=lock_cfg.get("lock_n_frames", 4),
             lock_sim_thresh=lock_cfg.get("lock_sim_threshold", 0.40),
             altitude_min_m=args.altitude_min,
@@ -348,7 +469,8 @@ def main():
 
     # Grid search
     all_results = _run_grid_search(
-        caches, base_pf_dict, GRID,
+        caches, base_pf_dict, grid,
+        trust_config=trust_config,
         metric=args.metric,
         lock_n_frames=lock_cfg.get("lock_n_frames", 4),
         lock_sim_thresh=lock_cfg.get("lock_sim_threshold", 0.40),
@@ -356,7 +478,7 @@ def main():
     )
 
     # Print top results
-    _print_top_results(all_results, args.top_n, args.metric)
+    _print_top_results(all_results, args.top_n, args.metric, grid)
 
     # Save CSV
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -367,7 +489,7 @@ def main():
             writer.writerows(all_results)
         print(f"\n[tune] Full results saved: {args.output}")
 
-    print("\n[tune] To apply best params, update pf_config.yaml particle_filter section,")
+    print("\n[tune] To apply best params, update pf_config.yaml particle_filter + trust sections,")
     print("       then run: python3 bench_all_bags.py --bags config/bags.yaml --use-cache")
 
 

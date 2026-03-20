@@ -46,6 +46,11 @@ class PFConfig:
     # Fine match consistency gate: reject fine updates too far from current estimate
     # Prevents visually-ambiguous patches from jumping the PF across the map.
     # Set to 0.0 to disable (always accept fine).
+    # Drift noise: extra per-step noise to simulate VIO-like uncertainty.
+    # Forces PF to rely on matching for correction. Scales with dt.
+    # 0 = disabled (pure RTK accuracy).
+    drift_noise_m_per_s: float = 0.0
+    drift_noise_hdg_per_s: float = 0.0
     fine_consistency_max_m: float = 0.0
     # High-inlier override: if inliers exceed this, bypass consistency gate
     # and recenter particles on the fine match position. Set to 0 to disable.
@@ -140,6 +145,16 @@ class ParticleFilter:
         self.particles[:, 0] += delta.dx_m + self.rng.normal(0, sigma_pos, n)
         self.particles[:, 1] += delta.dy_m + self.rng.normal(0, sigma_pos, n)
         self.particles[:, 2] = delta.heading_deg + self.rng.normal(0, sigma_hdg, n)
+
+        # Drift noise: accumulates over time, simulates VIO-like uncertainty
+        if self.cfg.drift_noise_m_per_s > 0.0 and delta.dt_s > 0.0:
+            drift_sigma = self.cfg.drift_noise_m_per_s * math.sqrt(delta.dt_s)
+            self.particles[:, 0] += self.rng.normal(0, drift_sigma, n)
+            self.particles[:, 1] += self.rng.normal(0, drift_sigma, n)
+        if self.cfg.drift_noise_hdg_per_s > 0.0 and delta.dt_s > 0.0:
+            hdg_sigma = self.cfg.drift_noise_hdg_per_s * math.sqrt(delta.dt_s)
+            self.particles[:, 2] += self.rng.normal(0, hdg_sigma, n)
+
         # Normalize heading to [0, 360)
         self.particles[:, 2] %= 360.0
 
@@ -224,20 +239,30 @@ class ParticleFilter:
         else:
             self.weights = np.full(N, 1.0 / N)
 
-    def inject_coarse_trust(self, east: float, north: float, sim: float):
-        """If sim exceeds threshold, teleport most particles to (east, north).
+    def inject_coarse_trust(self, east: float, north: float, sim: float,
+                            teleport_fraction_override: Optional[float] = None,
+                            teleport_sigma_override: Optional[float] = None):
+        """Teleport particles to (east, north).
 
-        Replaces `coarse_trust_fraction` of particles with fresh samples
-        drawn from a tight Gaussian around the match, keeping the rest
-        for diversity.  Weights are reset to uniform.
+        When overrides are provided (from trust_model), uses those directly.
+        Otherwise falls back to the original threshold-based logic.
         """
         if self.particles is None:
             return
-        if self.cfg.coarse_trust_sim <= 0.0 or sim < self.cfg.coarse_trust_sim:
-            return
+
+        # Determine fraction and sigma
+        if teleport_fraction_override is not None:
+            fraction = teleport_fraction_override
+            sigma = teleport_sigma_override if teleport_sigma_override is not None \
+                else self.cfg.coarse_trust_sigma
+        else:
+            if self.cfg.coarse_trust_sim <= 0.0 or sim < self.cfg.coarse_trust_sim:
+                return
+            fraction = self.cfg.coarse_trust_fraction
+            sigma = self.cfg.coarse_trust_sigma
 
         n = len(self.particles)
-        n_inject = int(self.cfg.coarse_trust_fraction * n)
+        n_inject = int(fraction * n)
         n_keep = n - n_inject
 
         # Keep the highest-weight existing particles
@@ -246,7 +271,6 @@ class ParticleFilter:
         # Preserve current heading estimate for injected particles
         est_hdg = float(np.average(self.particles[:, 2], weights=self.weights))
 
-        sigma = self.cfg.coarse_trust_sigma
         new_e = self.rng.normal(east, sigma, n_inject)
         new_n = self.rng.normal(north, sigma, n_inject)
         new_h = self.rng.normal(est_hdg, 10.0, n_inject) % 360.0
@@ -258,8 +282,14 @@ class ParticleFilter:
         self.weights = np.full(n, 1.0 / n)
 
     def update_fine(self, fine_east: float, fine_north: float, inliers: int,
-                    heading_deg: Optional[float] = None) -> bool:
+                    heading_deg: Optional[float] = None,
+                    sigma_override: Optional[float] = None,
+                    kappa_override: Optional[float] = None) -> bool:
         """Update weights from fine match result.
+
+        When sigma_override / kappa_override are provided (from trust_model),
+        those values are used directly, skipping the internal inlier-tier logic.
+        Otherwise falls back to the original 4-tier system.
 
         Returns True if update was applied, False if rejected by consistency gate.
         """
@@ -269,24 +299,52 @@ class ParticleFilter:
         if math.isnan(fine_east) or math.isnan(fine_north):
             return False
 
-        # Consistency gate: reject if fine match is too far from current estimate
-        if self.cfg.fine_consistency_max_m > 0.0:
+        # Consistency gate: relax for high-inlier matches
+        if self.cfg.fine_consistency_max_m > 0.0 and sigma_override is None:
             est_e, est_n, _ = self.estimate()
             dist = math.sqrt((fine_east - est_e) ** 2 + (fine_north - est_n) ** 2)
-            if dist > self.cfg.fine_consistency_max_m:
+            max_dist = self.cfg.fine_consistency_max_m
+            if inliers > 40:
+                max_dist *= 4.0
+            elif inliers > 25:
+                max_dist *= 2.0
+            if dist > max_dist:
                 return False
 
-        sigma2 = 2.0 * self.cfg.sigma_obs_fine ** 2
+        # Determine sigma
+        if sigma_override is not None:
+            sigma = sigma_override
+        else:
+            base_sigma = self.cfg.sigma_obs_fine
+            if inliers > 40:
+                sigma = base_sigma * 0.3
+            elif inliers > 25:
+                sigma = base_sigma * 0.5
+            elif inliers > 15:
+                sigma = base_sigma
+            else:
+                sigma = base_sigma * 2.0
+
+        sigma2 = 2.0 * sigma ** 2
         dx = self.particles[:, 0] - fine_east
         dy = self.particles[:, 1] - fine_north
         dist2 = dx ** 2 + dy ** 2
         log_likelihood = -dist2 / sigma2
 
-        # Von Mises heading update if enough inliers
+        # Von Mises heading update
         if heading_deg is not None and inliers >= self.cfg.fine_min_inliers_heading:
-            kappa = 5.0  # ~26 deg std dev
-            diff_rad = np.radians(self.particles[:, 2] - heading_deg)
-            log_likelihood += kappa * np.cos(diff_rad)
+            if kappa_override is not None:
+                kappa = kappa_override
+            else:
+                if inliers > 40:
+                    kappa = 15.0
+                elif inliers > 25:
+                    kappa = 10.0
+                else:
+                    kappa = 5.0
+            if kappa > 0:
+                diff_rad = np.radians(self.particles[:, 2] - heading_deg)
+                log_likelihood += kappa * np.cos(diff_rad)
 
         log_weights = np.log(self.weights + 1e-300) + log_likelihood
         log_weights -= log_weights.max()

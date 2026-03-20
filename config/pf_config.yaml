@@ -16,6 +16,9 @@ particle_filter:
   sigma_pos_tracking: 1.0
   sigma_hdg_dispersed: 10.0
   sigma_hdg_tracking: 3.0
+  # Drift noise: simulates VIO-like uncertainty, forces PF to rely on matching
+  drift_noise_m_per_s: 0.3        # m/√s position drift (0=disabled). 0.3 → ~1m spread after 3s
+  drift_noise_hdg_per_s: 0.5      # deg/√s heading drift (0=disabled)
   sigma_obs_coarse: 40.0         # tuned: grid search best (40 > 30 prevents particle deprivation)
   sigma_obs_fine: 5.0            # tuned: grid search best (5 < 8, tighter fine observation)
   top_k_coarse: 5
@@ -38,18 +41,38 @@ particle_filter:
   # Fine match consistency gate (0 = disabled)
   fine_consistency_max_m: 50.0     # reject fine matches > 50m from PF estimate
   fine_force_inliers: 0             # disabled
-  # Trust gating thresholds
-  trust_recon_sim_min: 0.15        # min reconstructed sim to trust mosaic/satellite fine
-  trust_coarse_sim_min: 0.3        # min coarse top-1 sim to trust top-1 fine
-  trust_high_inliers: 20           # inliers above this bypass sim gates
-  trust_cross_agree_m: 30.0        # mosaic vs top-1 agreement distance (m)
-  trust_drift_recon_sim: 0.3       # below this + disagreement → drift detected
-  trust_drift_coarse_sim: 0.4      # above this + disagreement → trust coarse over mosaic
-  # Strong coarse trust: if top-1 sim > threshold, teleport particles there
-  # Set to 0.0 to disable
-  coarse_trust_sim: 0.4
-  coarse_trust_fraction: 0.7    # fraction of particles to replace
-  coarse_trust_sigma: 20.0      # spatial spread of injected particles (m)
+
+trust:
+  # Signal weights (must sum to 1.0)
+  inlier_tau: 25.0
+  inlier_weight: 0.35
+  sim_floor: 0.10
+  sim_ceiling: 0.55
+  sim_weight: 0.20
+  consistency_weight: 0.15
+  consistency_min_radius_m: 30.0
+  agreement_weight: 0.10
+  agreement_scale_m: 40.0
+  altitude_weight: 0.10
+  altitude_ref_m: 60.0
+  temporal_weight: 0.10
+  temporal_max_speed_m_s: 15.0
+  # Sigma modulation
+  sigma_min_scale: 1.0
+  sigma_max_scale: 5.0
+  # Drift detection
+  drift_pf_confidence_threshold: 0.3
+  drift_recon_sim_threshold: 0.20
+  drift_coarse_sim_min: 0.35
+  drift_sigma_cap: 3.0
+  # EMA smoothing
+  ema_alpha: 0.3
+  min_confidence: 0.05
+  # Coarse teleport (continuous)
+  coarse_sim_floor: 0.25
+  coarse_sim_ceiling: 0.60
+  coarse_max_teleport_fraction: 0.8
+  coarse_teleport_sigma_range: [15.0, 30.0]
 
 matchers:
   script_dir: "/media/aniel/storage/bags_jetson/vpr_dinov3/dinov2_vits_layer_test"
@@ -88,7 +111,7 @@ init:
   lock_sim_threshold: 0.3  # minimum sim to count as a hit
 
 replay:
-  mcap_path: "/media/aniel/storage/bags_jetson/05e5e3545cbe8ff300a5b5bbb2eff4be/Day2.4_80_0.mcap"
+  mcap_path: "/media/aniel/storage/bags_jetson/095c6d2c7237fe986c6240628b6ef8dd/Day2.6_0.mcap"
   camera_topic: "/camera/image_mono"
   rtk_topic: "/m300/rtk/fix"
   yaw_topic: "/m300/rtk/yaw"

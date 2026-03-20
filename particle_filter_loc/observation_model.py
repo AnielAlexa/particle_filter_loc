@@ -270,11 +270,6 @@ class ObservationModel:
         # Scale patch keypoints to composite pixel space
         mkpts1_patch = mkpts1 * np.array([[patch_w / res, patch_h / res]], dtype=np.float32)
 
-        # Homography for visualization (drone 320px → patch 320px matcher space)
-        vis_H = None
-        if len(mkpts0) >= 4:
-            vis_H, _ = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
-
         # --- PnP ---
         lat, lon, inliers, method, heading_deg = None, None, 0, "homography", None
 
@@ -285,6 +280,7 @@ class ObservationModel:
                 method = "pnp"
 
         # --- Homography fallback ---
+        vis_mask = None
         if lat is None:
             if len(mkpts0) < 4:
                 return None
@@ -299,15 +295,26 @@ class ObservationModel:
                 return None
             lat, lon = h_result
             method = "homography"
+            vis_mask = hm.ravel().astype(bool)
+        else:
+            # PnP: compute homography just for inlier mask (visualization only)
+            if len(mkpts0) >= 4:
+                _, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
+                if hm is not None:
+                    vis_mask = hm.ravel().astype(bool)
 
         if inliers < self.min_inliers:
             return None
 
+        # Filter to inliers only for visualization
+        vis0 = mkpts0[vis_mask] if vis_mask is not None else mkpts0
+        vis1 = mkpts1_patch[vis_mask] if vis_mask is not None else mkpts1_patch
+
         return FineResult(
             lat=lat, lon=lon, inliers=inliers, method=method,
             heading_deg=heading_deg, patch_name=patch_name,
-            mkpts_drone=mkpts0, mkpts_patch=mkpts1_patch,
-            H=vis_H,
+            mkpts_drone=vis0, mkpts_patch=vis1,
+            H=None,
         )
 
     def fine_match_on_mosaic(
@@ -383,10 +390,6 @@ class ObservationModel:
             "patch_w": mw,
         }
 
-        vis_H = None
-        if len(mkpts0) >= 4:
-            vis_H, _ = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
-
         lat, lon, inliers, method, heading_deg_out = None, None, 0, "homography", None
 
         if len(mkpts0) >= self.min_inliers_ransac:
@@ -395,12 +398,13 @@ class ObservationModel:
                 lat, lon, heading_deg_out, inliers = pnp_result
                 method = "pnp"
 
+        vis_mask = None
         if lat is None:
             if len(mkpts0) < 4:
                 return None
             # Homography on North-up keypoints
             H_northup, hm = cv2.findHomography(
-                mkpts0 * np.array([[mw / res, mh / res]], dtype=np.float32),  # scale drone kpts to match
+                mkpts0 * np.array([[mw / res, mh / res]], dtype=np.float32),
                 mkpts1_northup, cv2.RANSAC, 5.0,
             )
             if H_northup is None:
@@ -418,15 +422,24 @@ class ObservationModel:
             lat = flat_meta["max_lat"] - py * (flat_meta["max_lat"] - flat_meta["min_lat"]) / (mh - 1)
             lon = flat_meta["min_lon"] + px * (flat_meta["max_lon"] - flat_meta["min_lon"]) / (mw - 1)
             method = "homography"
+            vis_mask = hm.ravel().astype(bool)
+        else:
+            if len(mkpts0) >= 4:
+                _, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
+                if hm is not None:
+                    vis_mask = hm.ravel().astype(bool)
 
         if inliers < self.min_inliers:
             return None
 
+        vis0 = mkpts0[vis_mask] if vis_mask is not None else mkpts0
+        vis1 = mkpts1_rot[vis_mask] if vis_mask is not None else mkpts1_rot
+
         return FineResult(
             lat=lat, lon=lon, inliers=inliers, method=method,
             heading_deg=heading_deg_out, patch_name="mosaic",
-            mkpts_drone=mkpts0, mkpts_patch=mkpts1_rot,
-            H=vis_H,
+            mkpts_drone=vis0, mkpts_patch=vis1,
+            H=None,
         )
 
     def fine_match_on_satellite(
@@ -494,10 +507,6 @@ class ObservationModel:
             "patch_w": mw,
         }
 
-        vis_H = None
-        if len(mkpts0) >= 4:
-            vis_H, _ = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
-
         lat, lon, inliers, method, heading_deg = None, None, 0, "homography", None
 
         if len(mkpts0) >= self.min_inliers_ransac:
@@ -506,6 +515,7 @@ class ObservationModel:
                 lat, lon, heading_deg, inliers = pnp_result
                 method = "pnp"
 
+        vis_mask = None
         if lat is None:
             if len(mkpts0) < 4:
                 return None
@@ -526,15 +536,24 @@ class ObservationModel:
             lat = flat_meta["max_lat"] - py * (flat_meta["max_lat"] - flat_meta["min_lat"]) / (mh - 1)
             lon = flat_meta["min_lon"] + px * (flat_meta["max_lon"] - flat_meta["min_lon"]) / (mw - 1)
             method = "homography"
+            vis_mask = hm.ravel().astype(bool)
+        else:
+            if len(mkpts0) >= 4:
+                _, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
+                if hm is not None:
+                    vis_mask = hm.ravel().astype(bool)
 
         if inliers < self.min_inliers:
             return None
 
+        vis0 = mkpts0[vis_mask] if vis_mask is not None else mkpts0
+        vis1 = mkpts1_sat[vis_mask] if vis_mask is not None else mkpts1_sat
+
         return FineResult(
             lat=lat, lon=lon, inliers=inliers, method=method,
             heading_deg=heading_deg, patch_name="satellite",
-            mkpts_drone=mkpts0, mkpts_patch=mkpts1_sat,
-            H=vis_H,
+            mkpts_drone=vis0, mkpts_patch=vis1,
+            H=None,
         )
 
     # ------------------------------------------------------------------
@@ -593,21 +612,25 @@ class ObservationModel:
         if not ok or inlier_idx is None or len(inlier_idx) < self.min_inliers_ransac:
             return None
 
-        # Refine pose using inliers only
+        # Refine pose using inliers only (fall back to RANSAC result if refinement diverges)
+        rvec_ref, tvec_ref = rvec.copy(), tvec.copy()
         inlier_obj = obj_pts[inlier_idx.flatten()]
         inlier_img = img_pts[inlier_idx.flatten()]
         try:
-            ok2, rvec, tvec = cv2.solvePnP(
-                inlier_obj, inlier_img, K, None, rvec, tvec, True,
+            ok2, rvec2, tvec2 = cv2.solvePnP(
+                inlier_obj, inlier_img, K, None, rvec_ref, tvec_ref, True,
                 cv2.SOLVEPNP_ITERATIVE,
             )
+            if ok2 and np.all(np.isfinite(tvec2)) and np.all(np.isfinite(rvec2)):
+                rvec, tvec = rvec2, tvec2
         except Exception:
-            ok2 = False
-        if not ok2:
-            return None
+            pass  # keep RANSAC result
 
         R, _ = cv2.Rodrigues(rvec)
         cam_pos = (-R.T @ tvec).flatten()
+
+        if not np.all(np.isfinite(cam_pos)):
+            return None
 
         # Sanity check: PnP altitude must be within 50% of live altimeter reading
         if self.altitude_m > 0.0 and abs(cam_pos[2] - self.altitude_m) > self.altitude_m * 0.5:
