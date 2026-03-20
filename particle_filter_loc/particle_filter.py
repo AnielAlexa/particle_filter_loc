@@ -162,16 +162,26 @@ class ParticleFilter:
         """Update weights from coarse matches using a Gaussian mixture model.
 
         Each tuple: (east, north, similarity).
-        The K patches are treated as K components of a single mixture observation:
-            p(z | x_i) = sum_k  w_k * N(x_i; mu_k, sigma²)
-        where w_k = softmax(sim_k / T) — sim scores select which patch to believe,
-        not how much total evidence there is.  This avoids double-counting when
-        multiple patches cluster together.
+        Applies three filters to prevent distant wrong patches from pulling particles:
+        1. Drop candidates with sim < 0.3 (not discriminative)
+        2. If top-1 gap > 0.05, use only top-1 (clear winner)
+        3. Cap distance: particles > 3*sigma from a patch center get zero from that patch
         """
         if self.particles is None or len(top_k_patches) == 0:
             return
 
-        sims = np.array([s for _, _, s in top_k_patches], dtype=np.float64)
+        # Filter: drop candidates with sim < 0.3
+        filtered = [(e, n, s) for e, n, s in top_k_patches if s >= 0.3]
+        if not filtered:
+            return
+
+        # If top-1 is clearly dominant (gap > 0.05), use only top-1
+        if len(filtered) >= 2:
+            gap = filtered[0][2] - filtered[1][2]
+            if gap > 0.05:
+                filtered = filtered[:1]
+
+        sims = np.array([s for _, _, s in filtered], dtype=np.float64)
         # Softmax mixture weights over the K candidates
         log_mix = sims / temperature
         log_mix -= log_mix.max()
@@ -180,21 +190,30 @@ class ParticleFilter:
 
         sigma = self.get_obs_sigma_coarse(altitude_m)
         sigma2 = 2.0 * sigma ** 2
+        dist_cap = 3.0 * sigma  # particles beyond this get zero likelihood from this patch
         N = len(self.particles)
 
-        # log p(z | x_i) = logsumexp_k [ log(mix_w[k]) - dist(x_i, mu_k)^2 / sigma2 ]
-        # Shape: [N, K]
-        log_components = np.empty((N, len(top_k_patches)), dtype=np.float64)
-        for k, (east, north, _) in enumerate(top_k_patches):
+        # log p(z | x_i) = logsumexp_k [ log(mix_w[k]) - dist²/sigma2 ]
+        # with distance cap: if dist > 3*sigma, set log_component to -inf
+        NEG_INF = -1e30
+        log_components = np.empty((N, len(filtered)), dtype=np.float64)
+        for k, (east, north, _) in enumerate(filtered):
             dx = self.particles[:, 0] - east
             dy = self.particles[:, 1] - north
-            log_components[:, k] = np.log(mix_w[k] + 1e-300) - (dx**2 + dy**2) / sigma2
+            dist2 = dx**2 + dy**2
+            lc = np.log(mix_w[k] + 1e-300) - dist2 / sigma2
+            lc[dist2 > dist_cap**2] = NEG_INF
+            log_components[:, k] = lc
 
         # logsumexp over K for each particle
         lse_max = log_components.max(axis=1, keepdims=True)
         log_likelihood = lse_max.squeeze(1) + np.log(
             np.exp(log_components - lse_max).sum(axis=1) + 1e-300
         )
+
+        # Particles that got NEG_INF from all patches: don't change their weight
+        all_capped = log_components.max(axis=1) <= NEG_INF
+        log_likelihood[all_capped] = 0.0  # neutral — no update for distant particles
 
         log_weights = np.log(self.weights + 1e-300) + log_likelihood
         log_weights -= log_weights.max()

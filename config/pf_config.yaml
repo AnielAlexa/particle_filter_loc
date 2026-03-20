@@ -88,12 +88,12 @@ init:
   lock_sim_threshold: 0.3  # minimum sim to count as a hit
 
 replay:
-  mcap_path: "/media/aniel/storage/bags_jetson/1f24cb6af4e6fea2d9d31829715aad95/Day3.1_0.mcap"
+  mcap_path: "/media/aniel/storage/bags_jetson/05e5e3545cbe8ff300a5b5bbb2eff4be/Day2.4_80_0.mcap"
   camera_topic: "/camera/image_mono"
   rtk_topic: "/m300/rtk/fix"
   yaw_topic: "/m300/rtk/yaw"
   altimeter_topic: "/altimeter/range"
-  start_offset_s: 20.0        # skip this many seconds from bag start
+  start_offset_s: 40.0        # skip this many seconds from bag start
   camera_subsample: 1
   altitude_min_process_m: 50.0  # skip camera frames if median altitude below this
   output_csv: "results/pf_results.csv"
