@@ -161,10 +161,16 @@ class ObservationModel:
                 grayscale=self.grayscale,
             )
 
-        # ── Fine matcher (TRT, always loaded) ───────────────────────────
-        fine_path = script_dir / config["fine_engine_path"]
-        print(f"Loading fine matcher engine: {fine_path}")
-        self.matcher = mod.TRTWrapper(str(fine_path))
+        # ── Fine matcher (TRT or PyTorch) ────────────────────────────────
+        use_pytorch = config.get("use_pytorch_matcher", False)
+        if use_pytorch:
+            fine_ckpt = script_dir / config["fine_ckpt_path"]
+            self.matcher = mod.PyTorchMatcherWrapper(str(fine_ckpt), input_size=self.matcher_resolution)
+            print(f"Fine matcher: PyTorch ELoFTR (FP32) from {fine_ckpt}")
+        else:
+            fine_path = script_dir / config["fine_engine_path"]
+            self.matcher = mod.TRTWrapper(str(fine_path))
+            print(f"Fine matcher: TensorRT ELoFTR from {fine_path}")
         print("Models loaded.")
 
     # ------------------------------------------------------------------

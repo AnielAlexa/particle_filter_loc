@@ -68,6 +68,10 @@ trust:
   # EMA smoothing
   ema_alpha: 0.3
   min_confidence: 0.05
+  # High-confidence joint gate (satellite/mosaic candidates only)
+  recon_high_conf_sim_thr: 0.30     # recon_sim must exceed this
+  recon_high_conf_inlier_thr: 25    # inliers must exceed this
+  recon_high_conf_boost: 1.5        # confidence multiplier when both met
   # Coarse teleport (continuous)
   coarse_sim_floor: 0.25
   coarse_sim_ceiling: 0.60
@@ -91,6 +95,8 @@ matchers:
   patch_names_path: "data/descriptors_boq/patch_names.txt"
   # ─────────────────────────────────────────────────────────────────────
   fine_engine_path: "MatchAnything/matchanything_eloftr_320.trt"
+  use_pytorch_matcher: false         # true = PyTorch FP32, false = TRT
+  fine_ckpt_path: "MatchAnything/matchanything_eloftr.ckpt"
   gps_metadata_path: "data/patches/gps_metadata.json"
   patches_dir: "data/patches"
   image_size: 256
@@ -101,7 +107,7 @@ matchers:
   camera_cx: 151.1
   camera_cy: 221.9
   context_enabled: true
-  context_fraction: 0.5
+  context_fraction: 0.3
   fine_conf_threshold: 0.20
   min_inliers_ransac: 4
   min_inliers: 8
@@ -111,7 +117,7 @@ init:
   lock_sim_threshold: 0.3  # minimum sim to count as a hit
 
 replay:
-  mcap_path: "/media/aniel/storage/bags_jetson/095c6d2c7237fe986c6240628b6ef8dd/Day2.6_0.mcap"
+  mcap_path: "/media/aniel/storage/bags_jetson/3b12c33fb6c0c824e5461dc5656404cc/Day4.2_0.mcap"
   camera_topic: "/camera/image_mono"
   rtk_topic: "/m300/rtk/fix"
   yaw_topic: "/m300/rtk/yaw"

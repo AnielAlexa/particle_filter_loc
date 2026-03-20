@@ -41,6 +41,12 @@ class TrustConfig:
     drift_recon_sim_threshold: float = 0.20
     drift_coarse_sim_min: float = 0.35
     drift_sigma_cap: float = 3.0
+    # High-confidence joint gate: recon_sim high + many inliers → confidence boost
+    # Applies only to satellite/mosaic candidates (recon-based paths).
+    # Boost is a multiplier on the final confidence score, clamped to 1.0.
+    recon_high_conf_sim_thr: float = 0.30
+    recon_high_conf_inlier_thr: int = 25
+    recon_high_conf_boost: float = 1.5
     # EMA smoothing
     ema_alpha: float = 0.3
     # Minimum confidence to apply any update
@@ -165,6 +171,14 @@ def score_candidate(
     ]
     log_conf = sum(w * math.log(max(s, 1e-10)) for s, w in signals)
     cs.confidence = math.exp(log_conf)
+
+    # High-confidence joint gate: recon_sim (= sim for sat/mosaic) high AND
+    # many inliers → multiplicative boost so get_effective_sigma() gives a
+    # tighter Gaussian → stronger particle pull toward this position.
+    if (source in ("satellite", "mosaic")
+            and sim >= cfg.recon_high_conf_sim_thr
+            and inliers >= cfg.recon_high_conf_inlier_thr):
+        cs.confidence = min(1.0, cs.confidence * cfg.recon_high_conf_boost)
 
     return cs
 
