@@ -430,16 +430,29 @@ class ObservationModel:
             method = "homography"
             vis_mask = hm.ravel().astype(bool)
         else:
+            # PnP succeeded: compute homography in 320px space just for viz inlier mask
             if len(mkpts0) >= 4:
                 _, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
                 if hm is not None:
                     vis_mask = hm.ravel().astype(bool)
+            # Fallback: if homography degenerate, use conf-filtered matches as-is
+            # (already geometric inliers from PnP; homography just refines viz)
 
         if inliers < self.min_inliers:
             return None
 
-        vis0 = mkpts0[vis_mask] if vis_mask is not None else mkpts0
-        vis1 = mkpts1_rot[vis_mask] if vis_mask is not None else mkpts1_rot
+        if vis_mask is not None:
+            vis0 = mkpts0[vis_mask]
+            vis1 = mkpts1_rot[vis_mask]
+        else:
+            # No homography mask available — subsample to avoid showing all
+            # conf-filtered matches (some may be non-inliers in the viz)
+            vis0 = mkpts0
+            vis1 = mkpts1_rot
+            if len(vis0) > 80:
+                idx = np.random.choice(len(vis0), 80, replace=False)
+                vis0 = vis0[idx]
+                vis1 = vis1[idx]
 
         return FineResult(
             lat=lat, lon=lon, inliers=inliers, method=method,
@@ -544,16 +557,26 @@ class ObservationModel:
             method = "homography"
             vis_mask = hm.ravel().astype(bool)
         else:
+            # PnP succeeded: compute homography in 320px space just for viz inlier mask
             if len(mkpts0) >= 4:
                 _, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
                 if hm is not None:
                     vis_mask = hm.ravel().astype(bool)
+            # Fallback: if homography degenerate, use conf-filtered matches as-is
 
         if inliers < self.min_inliers:
             return None
 
-        vis0 = mkpts0[vis_mask] if vis_mask is not None else mkpts0
-        vis1 = mkpts1_sat[vis_mask] if vis_mask is not None else mkpts1_sat
+        if vis_mask is not None:
+            vis0 = mkpts0[vis_mask]
+            vis1 = mkpts1_sat[vis_mask]
+        else:
+            vis0 = mkpts0
+            vis1 = mkpts1_sat
+            if len(vis0) > 80:
+                idx = np.random.choice(len(vis0), 80, replace=False)
+                vis0 = vis0[idx]
+                vis1 = vis1[idx]
 
         return FineResult(
             lat=lat, lon=lon, inliers=inliers, method=method,

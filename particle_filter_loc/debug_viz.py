@@ -77,12 +77,17 @@ def _build_match_panel(
         ref_w = ref_img.shape[1] if ref_img is not None else _SZ
         sx_r = _SZ / ref_w
         sy_r = _SZ / ref_h
-        n_draw = min(len(mkpts_drone), len(mkpts_ref), 80)
+        n_total = min(len(mkpts_drone), len(mkpts_ref))
+        n_draw = min(n_total, 80)
+        if n_total > n_draw:
+            draw_idx = np.random.choice(n_total, n_draw, replace=False)
+            mkpts_drone = mkpts_drone[draw_idx]
+            mkpts_ref = mkpts_ref[draw_idx]
 
         # Draw keypoints only for pairs that will have lines
-        for pt in mkpts_drone[:n_draw]:
+        for pt in mkpts_drone:
             cv2.circle(p_drone, (int(pt[0]), int(pt[1])), 2, (0, 255, 0), -1, cv2.LINE_AA)
-        for pt in mkpts_ref[:n_draw]:
+        for pt in mkpts_ref:
             cv2.circle(p_ref, (int(pt[0] * sx_r), int(pt[1] * sy_r)), 2, (0, 100, 255), -1, cv2.LINE_AA)
 
     # Combine side by side
@@ -90,7 +95,7 @@ def _build_match_panel(
 
     # Draw match lines across the two halves
     if has_matches:
-        for i in range(n_draw):
+        for i in range(len(mkpts_drone)):
             px_d = int(mkpts_drone[i, 0])
             py_d = int(mkpts_drone[i, 1])
             px_r = int(mkpts_ref[i, 0] * sx_r) + _SZ
@@ -101,7 +106,7 @@ def _build_match_panel(
             py_r = np.clip(py_r, 0, _SZ - 1)
             cv2.line(panel, (px_d, py_d), (px_r, py_r), line_color, 1, cv2.LINE_AA)
 
-        info = f"{method} {inliers}inl"
+        info = f"{method} {inliers}inl ({len(mkpts_drone)}shown)"
         _text(panel, [info], x=8, y0=20, scale=0.4, color=(0, 255, 0))
     else:
         _text(panel, ["no match"], x=8, y0=20, scale=0.4, color=(100, 100, 100))
