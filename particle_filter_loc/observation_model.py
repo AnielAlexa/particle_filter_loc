@@ -115,6 +115,23 @@ class ObservationModel:
         self.db_descriptors = F.normalize(self.db_descriptors.float().cuda(), dim=1)
         self.n_patches = self.db_descriptors.shape[0]
 
+        # Optional PCA dimensionality reduction (VLAD only)
+        self._pca_mean: Optional[torch.Tensor] = None
+        self._pca_components: Optional[torch.Tensor] = None
+        pca_dim = config.get("vlad_pca_dim", 0)
+        if use_vlad and pca_dim > 0:
+            orig_dim = self.db_descriptors.shape[1]
+            mean = self.db_descriptors.mean(dim=0)
+            X_c = self.db_descriptors - mean
+            _, S, Vh = torch.linalg.svd(X_c, full_matrices=False)
+            k = min(pca_dim, Vh.shape[0])
+            explained = (S[:k] ** 2).sum() / (S ** 2).sum()
+            self._pca_mean = mean
+            self._pca_components = Vh[:k]  # [k, D]
+            self.db_descriptors = F.normalize(X_c @ self._pca_components.T, dim=1)
+            print(f"PCA: {orig_dim}→{k} dims, explained: {explained:.1%}, "
+                  f"DB: {self.db_descriptors.shape}")
+
         # Patch names
         with open(str(names_path)) as f:
             self.patch_names = [l.strip() for l in f if l.strip()]
@@ -184,6 +201,10 @@ class ObservationModel:
         desc = self.extractor(tensor)
         desc = F.normalize(desc.float(), dim=1)
 
+        # Apply PCA projection if enabled
+        if self._pca_components is not None:
+            desc = F.normalize((desc - self._pca_mean) @ self._pca_components.T, dim=1)
+
         if candidate_indices is not None and len(candidate_indices) > 0:
             db_sub = self.db_descriptors[candidate_indices]
             sims = (desc @ db_sub.T).squeeze(0)
@@ -208,6 +229,9 @@ class ObservationModel:
         t_b = self.extractor.preprocess(img_b)
         d_a = F.normalize(self.extractor(t_a).float(), dim=1)
         d_b = F.normalize(self.extractor(t_b).float(), dim=1)
+        if self._pca_components is not None:
+            d_a = F.normalize((d_a - self._pca_mean) @ self._pca_components.T, dim=1)
+            d_b = F.normalize((d_b - self._pca_mean) @ self._pca_components.T, dim=1)
         return float((d_a @ d_b.T).squeeze())
 
     # ------------------------------------------------------------------

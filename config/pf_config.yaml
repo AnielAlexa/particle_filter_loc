@@ -83,12 +83,13 @@ matchers:
   # ── Coarse matcher switch ─────────────────────────────────────────────
   use_vlad: true
   # VLAD (timm DINOv3 + hard-assignment VLAD, no TRT required)
-  vlad_codebook_path:    "data/descriptors_vlad/vlad_codebook.pt"
-  vlad_database_path:    "data/descriptors_vlad/vlad_descriptors.pt"
-  vlad_patch_names_path: "data/descriptors_vlad/patch_names.txt"
+  vlad_codebook_path:    "data/descriptors_vlad_l10_aerial/vlad_codebook.pt"
+  vlad_database_path:    "data/descriptors_vlad_l10_aerial/vlad_descriptors.pt"
+  vlad_patch_names_path: "data/descriptors_vlad_l10_aerial/patch_names.txt"
   vlad_num_clusters: 16
   vlad_layer_idx: 10
   vlad_image_size: 256
+  vlad_pca_dim: 512            # 0 = no PCA, >0 = PCA whitening to N dims
   # BoQ TRT (set use_vlad: false to restore this path)
   boq_engine_path: "dinov3_lora_gray_boq_l10_value_256.engine"
   boq_database_path: "data/descriptors_boq/boq_descriptors.pt"
