@@ -12,22 +12,22 @@ enu_origin:
 particle_filter:
   n_dispersed: 200
   n_tracking: 100
-  sigma_pos_dispersed: 3.0
-  sigma_pos_tracking: 1.0
+  sigma_pos_dispersed: 2.0
+  sigma_pos_tracking: 0.3
   sigma_hdg_dispersed: 10.0
-  sigma_hdg_tracking: 3.0
+  sigma_hdg_tracking: 2.0
   # Drift noise: simulates VIO-like uncertainty, forces PF to rely on matching
-  drift_noise_m_per_s: 0.3        # m/√s position drift (0=disabled). 0.3 → ~1m spread after 3s
-  drift_noise_hdg_per_s: 0.5      # deg/√s heading drift (0=disabled)
-  sigma_obs_coarse: 40.0         # tuned: grid search best (40 > 30 prevents particle deprivation)
-  sigma_obs_fine: 5.0            # tuned: grid search best (5 < 8, tighter fine observation)
+  drift_noise_m_per_s: 0.3        # m/√s position drift — don't trust RTK
+  drift_noise_hdg_per_s: 0.5      # deg/√s heading drift
+  sigma_obs_coarse: 10.0         # tight coarse pull
+  sigma_obs_fine: 5.0            # tighter fine now that PnP bias is fixed
   top_k_coarse: 5
   ess_threshold_fraction: 0.5
-  init_altitude_m: 50.0          # tuned: was 15 — only init when high enough for VPR
-  converge_spread_m: 60.0        # tuned: grid search best
-  tracking_spread_m: 30.0        # tuned: grid search best (30 > 20, easier TRACKING entry)
+  init_altitude_m: 50.0          # only init when high enough for VPR
+  converge_spread_m: 40.0        # enter CONVERGING earlier
+  tracking_spread_m: 20.0        # enter TRACKING earlier
   lost_spread_m: 150.0
-  fine_every_n_frames: 1        # tuned: grid search best (more frequent fine updates)
+  fine_every_n_frames: 1
   fine_min_inliers_heading: 12
   # Adaptive search (driven by particle spread)
   min_search_radius_m: 40.0
@@ -39,7 +39,7 @@ particle_filter:
   altitude_sigma_ref_m: 60.0
   altitude_sigma_scale: 0.5
   # Fine match consistency gate (0 = disabled)
-  fine_consistency_max_m: 50.0     # reject fine matches > 50m from PF estimate
+  fine_consistency_max_m: 20.0     # reject fine matches > 20m from PF estimate
   fine_force_inliers: 0             # disabled
 
 trust:
@@ -58,15 +58,15 @@ trust:
   temporal_weight: 0.10
   temporal_max_speed_m_s: 15.0
   # Sigma modulation
-  sigma_min_scale: 1.0
-  sigma_max_scale: 5.0
+  sigma_min_scale: 0.5
+  sigma_max_scale: 3.0
   # Drift detection
   drift_pf_confidence_threshold: 0.3
   drift_recon_sim_threshold: 0.20
   drift_coarse_sim_min: 0.35
   drift_sigma_cap: 3.0
   # EMA smoothing
-  ema_alpha: 0.3
+  ema_alpha: 0.5
   min_confidence: 0.05
   # High-confidence joint gate (satellite/mosaic candidates only)
   recon_high_conf_sim_thr: 0.30     # recon_sim must exceed this
@@ -89,7 +89,7 @@ matchers:
   vlad_num_clusters: 16
   vlad_layer_idx: 10
   vlad_image_size: 256
-  vlad_pca_dim: 512            # 0 = no PCA, >0 = PCA whitening to N dims
+  vlad_pca_dim: 768            # 0 = no PCA, >0 = PCA whitening to N dims
   # BoQ TRT (set use_vlad: false to restore this path)
   boq_engine_path: "dinov3_lora_gray_boq_l10_value_256.engine"
   boq_database_path: "data/descriptors_boq/boq_descriptors.pt"
@@ -118,7 +118,7 @@ init:
   lock_sim_threshold: 0.3  # minimum sim to count as a hit
 
 replay:
-  mcap_path: "/media/aniel/storage/bags_jetson/05e5e3545cbe8ff300a5b5bbb2eff4be/Day2.4_80_0.mcap"
+  mcap_path: "/media/aniel/storage/bags_jetson/095c6d2c7237fe986c6240628b6ef8dd/Day2.6_0.mcap"
   camera_topic: "/camera/image_mono"
   rtk_topic: "/m300/rtk/fix"
   yaw_topic: "/m300/rtk/yaw"

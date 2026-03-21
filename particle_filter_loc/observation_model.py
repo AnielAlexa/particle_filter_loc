@@ -620,6 +620,8 @@ class ObservationModel:
         meta: dict,
     ) -> Optional[Tuple[float, float, float]]:
         """Returns (lat, lon, heading_deg) or None."""
+        print(f"[PnP] entry: {len(mkpts_drone)} pts, alt={self.altitude_m:.1f}m, "
+              f"patch=({meta['patch_w']}x{meta['patch_h']})")
         min_lat = meta["min_lat"]
         max_lat = meta["max_lat"]
         min_lon = meta["min_lon"]
@@ -659,11 +661,32 @@ class ObservationModel:
                 100, 8.0, 0.99, None,
                 cv2.SOLVEPNP_ITERATIVE,
             )
-        except Exception:
+        except Exception as e:
+            print(f"[PnP] solvePnPRansac exception: {e}")
             return None
 
         if not ok or inlier_idx is None or len(inlier_idx) < self.min_inliers_ransac:
+            n_inl = len(inlier_idx) if inlier_idx is not None else 0
+            print(f"[PnP] RANSAC failed: ok={ok}, inliers={n_inl}, min={self.min_inliers_ransac}")
             return None
+
+        # RANSAC can return ok=True with NaN for coplanar scenes — re-solve with IPPE
+        if not (np.all(np.isfinite(rvec)) and np.all(np.isfinite(tvec))):
+            inlier_obj = obj_pts[inlier_idx.flatten()]
+            inlier_img = img_pts[inlier_idx.flatten()]
+            try:
+                ok_ip, rvec_ip, tvec_ip = cv2.solvePnP(
+                    inlier_obj, inlier_img, K, None,
+                    flags=cv2.SOLVEPNP_IPPE,
+                )
+                if ok_ip and np.all(np.isfinite(rvec_ip)) and np.all(np.isfinite(tvec_ip)):
+                    rvec, tvec = rvec_ip, tvec_ip
+                else:
+                    print(f"[PnP] IPPE also failed")
+                    return None
+            except Exception as e:
+                print(f"[PnP] IPPE exception: {e}")
+                return None
 
         # Refine pose using inliers only (fall back to RANSAC result if refinement diverges)
         rvec_ref, tvec_ref = rvec.copy(), tvec.copy()
@@ -683,10 +706,20 @@ class ObservationModel:
         cam_pos = (-R.T @ tvec).flatten()
 
         if not np.all(np.isfinite(cam_pos)):
+            det = np.linalg.det(R)
+            obj_span = obj_pts.max(axis=0) - obj_pts.min(axis=0)
+            img_span = img_pts.max(axis=0) - img_pts.min(axis=0)
+            print(f"[PnP] non-finite cam_pos: rvec={rvec.flatten()}, tvec={tvec.flatten()}, "
+                  f"det(R)={det:.3f}, obj_span={obj_span}, img_span={img_span}, "
+                  f"inliers={len(inlier_idx)}")
             return None
 
         # Sanity check: PnP altitude must be within 50% of live altimeter reading
-        if self.altitude_m > 0.0 and abs(cam_pos[2] - self.altitude_m) > self.altitude_m * 0.5:
+        pnp_alt = float(cam_pos[2])
+        print(f"[PnP] alt_est={pnp_alt:.1f}m  alt_live={self.altitude_m:.1f}m  "
+              f"err={abs(pnp_alt - self.altitude_m):.1f}m  inliers={len(inlier_idx)}")
+        if self.altitude_m > 0.0 and abs(pnp_alt - self.altitude_m) > self.altitude_m * 0.5:
+            print(f"[PnP] REJECTED (>{self.altitude_m * 0.5:.1f}m threshold)")
             return None
 
         cam_lat = center_lat + cam_pos[1] / 111319.5
