@@ -120,17 +120,30 @@ class ObservationModel:
         self._pca_components: Optional[torch.Tensor] = None
         pca_dim = config.get("vlad_pca_dim", 0)
         if use_vlad and pca_dim > 0:
-            orig_dim = self.db_descriptors.shape[1]
-            mean = self.db_descriptors.mean(dim=0)
-            X_c = self.db_descriptors - mean
-            _, S, Vh = torch.linalg.svd(X_c, full_matrices=False)
-            k = min(pca_dim, Vh.shape[0])
-            explained = (S[:k] ** 2).sum() / (S ** 2).sum()
-            self._pca_mean = mean
-            self._pca_components = Vh[:k]  # [k, D]
-            self.db_descriptors = F.normalize(X_c @ self._pca_components.T, dim=1)
-            print(f"PCA: {orig_dim}→{k} dims, explained: {explained:.1%}, "
-                  f"DB: {self.db_descriptors.shape}")
+            pca_path = db_path.parent / "pca_components.pt"
+            if pca_path.exists():
+                pca_data = torch.load(str(pca_path), map_location="cuda")
+                self._pca_mean = pca_data["mean"].cuda()
+                self._pca_components = pca_data["components"][:pca_dim].cuda()
+                k = self._pca_components.shape[0]
+                orig_dim = self.db_descriptors.shape[1]
+                self.db_descriptors = F.normalize(
+                    (self.db_descriptors - self._pca_mean) @ self._pca_components.T, dim=1)
+                print(f"PCA (pre-computed): {orig_dim}→{k} dims, "
+                      f"trained on {pca_data.get('n_train_samples', '?')} samples, "
+                      f"DB: {self.db_descriptors.shape}")
+            else:
+                orig_dim = self.db_descriptors.shape[1]
+                mean = self.db_descriptors.mean(dim=0)
+                X_c = self.db_descriptors - mean
+                _, S, Vh = torch.linalg.svd(X_c, full_matrices=False)
+                k = min(pca_dim, Vh.shape[0])
+                explained = (S[:k] ** 2).sum() / (S ** 2).sum()
+                self._pca_mean = mean
+                self._pca_components = Vh[:k]
+                self.db_descriptors = F.normalize(X_c @ self._pca_components.T, dim=1)
+                print(f"PCA (on-the-fly): {orig_dim}→{k} dims, explained: {explained:.1%}, "
+                      f"DB: {self.db_descriptors.shape}")
 
         # Patch names
         with open(str(names_path)) as f:

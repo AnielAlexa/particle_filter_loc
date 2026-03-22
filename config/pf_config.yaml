@@ -17,7 +17,7 @@ particle_filter:
   sigma_hdg_dispersed: 10.0
   sigma_hdg_tracking: 2.0
   # Drift noise: simulates VIO-like uncertainty, forces PF to rely on matching
-  drift_noise_m_per_s: 0.3        # m/√s position drift — don't trust RTK
+  drift_noise_m_per_s: 0.3        # m/√s position drift — good VIO (ORB-SLAM3 class)
   drift_noise_hdg_per_s: 0.5      # deg/√s heading drift
   sigma_obs_coarse: 10.0         # tight coarse pull
   sigma_obs_fine: 5.0            # tighter fine now that PnP bias is fixed
@@ -118,7 +118,7 @@ init:
   lock_sim_threshold: 0.3  # minimum sim to count as a hit
 
 replay:
-  mcap_path: "/media/aniel/storage/bags_jetson/095c6d2c7237fe986c6240628b6ef8dd/Day2.6_0.mcap"
+  mcap_path: "/media/aniel/storage/bags_jetson/3b12c33fb6c0c824e5461dc5656404cc/Day4.2_0.mcap"
   camera_topic: "/camera/image_mono"
   rtk_topic: "/m300/rtk/fix"
   yaw_topic: "/m300/rtk/yaw"
