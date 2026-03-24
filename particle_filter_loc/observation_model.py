@@ -86,10 +86,24 @@ class ObservationModel:
         self.image_size = config.get("image_size", 256)
         self.grayscale = config.get("grayscale", True)
 
-        # ── Coarse matcher: VLAD or BoQ TRT ──────────────────────────────
+        # ── Coarse matcher: VLAD TRT / VLAD PyTorch / BoQ TRT ──────────
         use_vlad = config.get("use_vlad", False)
+        use_vlad_trt = config.get("use_vlad_trt", False)
 
-        if use_vlad:
+        if use_vlad_trt:
+            # TRT engine with VLAD+PCA baked in — outputs [1, 768] directly
+            mod = _import_match_module(config["script_dir"])
+            engine_path = script_dir / config["vlad_trt_engine_path"]
+            print(f"Loading VLAD+PCA TRT engine: {engine_path}")
+            self.extractor = mod.DINOv3VLADPCAExtractorTRT(
+                engine_path=str(engine_path),
+                image_size=self.image_size,
+                grayscale=self.grayscale,
+            )
+            # Use the same VLAD database projected through PCA
+            db_path = script_dir / config["vlad_database_path"]
+            names_path = script_dir / config["vlad_patch_names_path"]
+        elif use_vlad:
             from .vlad_extractor import DINOv3VLADExtractor
             codebook_path = script_dir / config["vlad_codebook_path"]
             self.extractor = DINOv3VLADExtractor(
@@ -106,7 +120,8 @@ class ObservationModel:
             names_path = script_dir / config["patch_names_path"]
 
         # Load descriptor database
-        print(f"Loading {'VLAD' if use_vlad else 'BoQ'} descriptors from {db_path} …")
+        coarse_label = "VLAD TRT" if use_vlad_trt else ("VLAD" if use_vlad else "BoQ")
+        print(f"Loading {coarse_label} descriptors from {db_path} …")
         data = torch.load(str(db_path), map_location="cuda")
         if isinstance(data, dict):
             self.db_descriptors = data.get("descriptors", data.get("boq_descriptors", list(data.values())[0]))
@@ -115,11 +130,14 @@ class ObservationModel:
         self.db_descriptors = F.normalize(self.db_descriptors.float().cuda(), dim=1)
         self.n_patches = self.db_descriptors.shape[0]
 
-        # Optional PCA dimensionality reduction (VLAD only)
+        # Optional PCA dimensionality reduction (VLAD paths only)
+        # For use_vlad_trt: PCA is baked into the engine for queries,
+        # but we still need to project the DB. Set _pca_components=None
+        # so coarse_match() does NOT re-apply PCA on query descriptors.
         self._pca_mean: Optional[torch.Tensor] = None
         self._pca_components: Optional[torch.Tensor] = None
         pca_dim = config.get("vlad_pca_dim", 0)
-        if use_vlad and pca_dim > 0:
+        if (use_vlad or use_vlad_trt) and pca_dim > 0:
             pca_path = db_path.parent / "pca_components.pt"
             if pca_path.exists():
                 pca_data = torch.load(str(pca_path), map_location="cuda")
@@ -144,6 +162,12 @@ class ObservationModel:
                 self.db_descriptors = F.normalize(X_c @ self._pca_components.T, dim=1)
                 print(f"PCA (on-the-fly): {orig_dim}→{k} dims, explained: {explained:.1%}, "
                       f"DB: {self.db_descriptors.shape}")
+
+        # For VLAD TRT: DB is projected, but engine already outputs PCA'd descriptors
+        # so clear _pca_components to prevent coarse_match() from re-applying PCA.
+        if use_vlad_trt:
+            self._pca_mean = None
+            self._pca_components = None
 
         # Patch names
         with open(str(names_path)) as f:
@@ -181,8 +205,8 @@ class ObservationModel:
         # ── Load match module (needed for fine matcher and optional BoQ) ─
         mod = _import_match_module(config["script_dir"])
 
-        # ── Coarse matcher: BoQ TRT (only when not using VLAD) ──────────
-        if not use_vlad:
+        # ── Coarse matcher: BoQ TRT (only when not using VLAD or VLAD TRT) ─
+        if not use_vlad and not use_vlad_trt:
             boq_path = script_dir / config["boq_engine_path"]
             print(f"Loading coarse BoQ engine: {boq_path}")
             self.extractor = mod.DINOv3LoRABoQExtractorTRT(

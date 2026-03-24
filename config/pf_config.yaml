@@ -81,7 +81,7 @@ trust:
 matchers:
   script_dir: "/media/aniel/storage/bags_jetson/vpr_dinov3/dinov2_vits_layer_test"
   # ── Coarse matcher switch ─────────────────────────────────────────────
-  use_vlad: true
+  use_vlad: false
   # VLAD (timm DINOv3 + hard-assignment VLAD, no TRT required)
   vlad_codebook_path:    "data/descriptors_vlad_l10_aerial/vlad_codebook.pt"
   vlad_database_path:    "data/descriptors_vlad_l10_aerial/vlad_descriptors.pt"
@@ -90,6 +90,9 @@ matchers:
   vlad_layer_idx: 10
   vlad_image_size: 256
   vlad_pca_dim: 768            # 0 = no PCA, >0 = PCA whitening to N dims
+  # VLAD+PCA TRT (set use_vlad: false, use_vlad_trt: true)
+  use_vlad_trt: true
+  vlad_trt_engine_path: "dinov3_vlad_pca768_l10_value_256.engine"
   # BoQ TRT (set use_vlad: false to restore this path)
   boq_engine_path: "dinov3_lora_gray_boq_l10_value_256.engine"
   boq_database_path: "data/descriptors_boq/boq_descriptors.pt"
@@ -118,7 +121,7 @@ init:
   lock_sim_threshold: 0.3  # minimum sim to count as a hit
 
 replay:
-  mcap_path: "/media/aniel/storage/bags_jetson/3b12c33fb6c0c824e5461dc5656404cc/Day4.2_0.mcap"
+  mcap_path: "/media/aniel/storage/bags_jetson/bea276eb8b0c91f69e638c5994519cba/Day3.3_0.mcap"
   camera_topic: "/camera/image_mono"
   rtk_topic: "/m300/rtk/fix"
   yaw_topic: "/m300/rtk/yaw"
