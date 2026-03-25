@@ -47,6 +47,16 @@ class TrustConfig:
     recon_high_conf_sim_thr: float = 0.30
     recon_high_conf_inlier_thr: int = 25
     recon_high_conf_boost: float = 1.5
+    # Global correction: relocalize from coarse+fine when reconstruction diverges
+    global_corr_enabled: bool = True
+    global_corr_recon_sim_threshold: float = 0.15
+    global_corr_min_frames: int = 3
+    global_corr_min_inliers: int = 10
+    global_corr_max_spread_m: float = 50.0
+    global_corr_position_consistency_m: float = 40.0
+    global_corr_cooldown_frames: int = 10
+    global_corr_teleport_fraction: float = 0.35
+    global_corr_teleport_sigma: float = 10.0
     # EMA smoothing
     ema_alpha: float = 0.3
     # Minimum confidence to apply any update
@@ -87,6 +97,17 @@ class FrameTrust:
     drift_detected: bool = False
     recon_sim_ema: float = 0.0
     pf_self_confidence_ema: float = 0.0
+
+
+@dataclass
+class GlobalCorrectionResult:
+    """Result of a global correction triggered by reconstruction divergence."""
+    east_m: float
+    north_m: float
+    heading_deg: Optional[float]
+    inliers_median: int
+    n_consistent_frames: int
+    distance_from_pf_m: float
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -193,6 +214,10 @@ class TrustTracker:
         self.prev_best_enu: Optional[Tuple[float, float]] = None
         self.prev_best_ts: Optional[float] = None
         self._initialized = False
+        # Global correction state
+        self._recon_diverge_count: int = 0
+        self._coarse_fine_hits: List[Tuple[float, float, int, Optional[float]]] = []
+        self._global_correction_cooldown: int = 0
 
     def _ema(self, old: float, new: float) -> float:
         a = self.cfg.ema_alpha
@@ -300,6 +325,101 @@ class TrustTracker:
 
     def get_effective_kappa(self, confidence: float) -> float:
         return 15.0 * confidence
+
+    def evaluate_global_correction(
+        self,
+        recon_sim: float,
+        coarse_fine_east: Optional[float],
+        coarse_fine_north: Optional[float],
+        coarse_fine_inliers: int,
+        coarse_fine_heading: Optional[float],
+        pf_east: float,
+        pf_north: float,
+        pf_spread: float,
+    ) -> Optional[GlobalCorrectionResult]:
+        """Check if a global correction should fire.
+
+        Accumulates evidence across frames: when reconstruction consistently
+        disagrees with the drone view but coarse+fine consistently finds a
+        strong match elsewhere, triggers a hard particle teleport.
+        """
+        cfg = self.cfg
+        if not cfg.global_corr_enabled:
+            return None
+
+        # Tick cooldown
+        if self._global_correction_cooldown > 0:
+            self._global_correction_cooldown -= 1
+
+        # Accumulate or reset
+        divergent = (
+            recon_sim < cfg.global_corr_recon_sim_threshold
+            and pf_spread < cfg.global_corr_max_spread_m
+        )
+        if divergent:
+            self._recon_diverge_count += 1
+            if (coarse_fine_east is not None
+                    and coarse_fine_north is not None
+                    and coarse_fine_inliers >= cfg.global_corr_min_inliers):
+                self._coarse_fine_hits.append((
+                    coarse_fine_east, coarse_fine_north,
+                    coarse_fine_inliers, coarse_fine_heading,
+                ))
+        else:
+            self._recon_diverge_count = 0
+            self._coarse_fine_hits.clear()
+
+        # Check trigger conditions
+        if (self._recon_diverge_count < cfg.global_corr_min_frames
+                or len(self._coarse_fine_hits) < cfg.global_corr_min_frames
+                or self._global_correction_cooldown > 0):
+            return None
+
+        # Compute median position from accumulated hits
+        hits = self._coarse_fine_hits
+        easts = [h[0] for h in hits]
+        norths = [h[1] for h in hits]
+        inliers_list = [h[2] for h in hits]
+        med_e = float(np.median(easts))
+        med_n = float(np.median(norths))
+
+        # Spatial consistency: hit positions must cluster
+        hit_spread = math.sqrt(np.var(easts) + np.var(norths))
+        if hit_spread > cfg.global_corr_position_consistency_m:
+            return None
+
+        # Distance from PF: must be significantly far (confirms PF is wrong)
+        dist_from_pf = math.sqrt((med_e - pf_east) ** 2 + (med_n - pf_north) ** 2)
+        if dist_from_pf < pf_spread * 2.0:
+            return None
+
+        # Heading: circular median, reject if too noisy
+        headings = [h[3] for h in hits if h[3] is not None]
+        result_heading: Optional[float] = None
+        if headings:
+            rads = [math.radians(h) for h in headings]
+            sin_sum = sum(math.sin(r) for r in rads)
+            cos_sum = sum(math.cos(r) for r in rads)
+            mean_hdg = math.degrees(math.atan2(sin_sum, cos_sum)) % 360.0
+            # Circular std: R = resultant length / n
+            R = math.sqrt(sin_sum ** 2 + cos_sum ** 2) / len(rads)
+            circ_std_deg = math.degrees(math.sqrt(-2.0 * math.log(max(R, 1e-6))))
+            if circ_std_deg < 30.0:
+                result_heading = mean_hdg
+
+        # Fire correction
+        self._global_correction_cooldown = cfg.global_corr_cooldown_frames
+        self._recon_diverge_count = 0
+        self._coarse_fine_hits.clear()
+
+        return GlobalCorrectionResult(
+            east_m=med_e,
+            north_m=med_n,
+            heading_deg=result_heading,
+            inliers_median=int(np.median(inliers_list)),
+            n_consistent_frames=len(hits),
+            distance_from_pf_m=dist_from_pf,
+        )
 
 
 def evaluate_coarse_trust(

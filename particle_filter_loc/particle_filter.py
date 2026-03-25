@@ -356,6 +356,42 @@ class ParticleFilter:
             self.weights = np.full(len(self.weights), 1.0 / len(self.weights))
         return True
 
+    def apply_global_correction(self, east: float, north: float,
+                                heading_deg: Optional[float] = None,
+                                teleport_fraction: float = 0.35,
+                                teleport_sigma: float = 10.0):
+        """Inject a competing particle cluster at a coarse+fine position.
+
+        Dual-hypothesis approach: keeps the majority of particles at the
+        current estimate and injects a cluster at the coarse+fine position.
+        Subsequent observation updates (coarse GMM + fine matching) will
+        naturally upweight whichever cluster is correct via resampling.
+        """
+        if self.particles is None:
+            return
+
+        n = len(self.particles)
+        n_inject = int(teleport_fraction * n)
+        n_keep = n - n_inject
+
+        # Keep highest-weight existing particles
+        keep_idx = np.argsort(self.weights)[-n_keep:]
+
+        new_e = self.rng.normal(east, teleport_sigma, n_inject)
+        new_n = self.rng.normal(north, teleport_sigma, n_inject)
+        if heading_deg is not None:
+            new_h = self.rng.normal(heading_deg, 5.0, n_inject) % 360.0
+        else:
+            est_hdg = float(np.average(self.particles[:, 2], weights=self.weights))
+            new_h = self.rng.normal(est_hdg, 10.0, n_inject) % 360.0
+
+        self.particles = np.vstack([
+            self.particles[keep_idx],
+            np.column_stack([new_e, new_n, new_h]),
+        ])
+        # Uniform weights — both clusters start equal, observations decide
+        self.weights = np.full(n, 1.0 / n)
+
     # ------------------------------------------------------------------
     # Resampling
     # ------------------------------------------------------------------

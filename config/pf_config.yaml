@@ -77,6 +77,16 @@ trust:
   coarse_sim_ceiling: 0.60
   coarse_max_teleport_fraction: 0.8
   coarse_teleport_sigma_range: [15.0, 30.0]
+  # Global correction: relocalize from coarse+fine when reconstruction diverges
+  global_corr_enabled: true
+  global_corr_recon_sim_threshold: 0.15   # recon_sim below this = "divergent"
+  global_corr_min_frames: 3               # consecutive divergent frames to trigger
+  global_corr_min_inliers: 10             # coarse-patch fine must have >= this
+  global_corr_max_spread_m: 50.0          # only when PF has tight spread
+  global_corr_position_consistency_m: 40.0 # coarse-fine positions must agree within this
+  global_corr_cooldown_frames: 10          # min frames between corrections
+  global_corr_teleport_fraction: 0.35      # fraction of particles injected as competing hypothesis
+  global_corr_teleport_sigma: 10.0         # spread of teleported particles (m)
 
 matchers:
   script_dir: "/media/aniel/storage/bags_jetson/vpr_dinov3/dinov2_vits_layer_test"
@@ -121,12 +131,12 @@ init:
   lock_sim_threshold: 0.3  # minimum sim to count as a hit
 
 replay:
-  mcap_path: "/media/aniel/storage/bags_jetson/46af2de34b02e5dad5fd8bc9047b1193/Bag5.3_0.mcap"
+  mcap_path: "/media/aniel/storage/bags_jetson/ec18bbfeef98b595877beeeb05666d33/Bag5.2_0.mcap"
   camera_topic: "/camera/image_mono"
   rtk_topic: "/m300/rtk/fix"
   yaw_topic: "/m300/rtk/yaw"
   altimeter_topic: "/altimeter/range"
-  start_offset_s: 40.0        # skip this many seconds from bag start
+  start_offset_s: 80.0        # skip this many seconds from bag start
   camera_subsample: 1
   altitude_min_process_m: 45.0  # skip camera frames if median altitude below this
   output_csv: "results/pf_results.csv"

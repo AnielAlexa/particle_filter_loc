@@ -27,7 +27,9 @@ from particle_filter_loc.particle_filter import PFConfig, ParticleFilter, Phase
 from particle_filter_loc.observation_model import ObservationModel
 from particle_filter_loc.debug_viz import DebugVisualizer
 from particle_filter_loc.footprint_reconstruction import SatelliteFootprintReconstructor
-from particle_filter_loc.trust_model import TrustConfig, TrustTracker, evaluate_coarse_trust
+from particle_filter_loc.trust_model import (
+    TrustConfig, TrustTracker, evaluate_coarse_trust, GlobalCorrectionResult,
+)
 
 
 def load_config(config_path: str) -> dict:
@@ -544,6 +546,38 @@ def run_replay(
                 else:
                     viz.fine_matched_name = "NO_TRUST"
 
+            # --- Global correction: relocalize from coarse+fine when recon diverges ---
+            global_corr = None
+            coarse_fine_e, coarse_fine_n = None, None
+            coarse_fine_inliers, coarse_fine_hdg = 0, None
+            if patch_fine is not None:
+                _cfe, _cfn = enu.wgs84_to_enu(patch_fine.lat, patch_fine.lon)
+                if np.isfinite(_cfe) and np.isfinite(_cfn):
+                    coarse_fine_e, coarse_fine_n = _cfe, _cfn
+                    coarse_fine_inliers = patch_fine.inliers
+                    coarse_fine_hdg = patch_fine.heading_deg
+
+            global_corr = trust_tracker.evaluate_global_correction(
+                recon_sim=recon_sim,
+                coarse_fine_east=coarse_fine_e,
+                coarse_fine_north=coarse_fine_n,
+                coarse_fine_inliers=coarse_fine_inliers,
+                coarse_fine_heading=coarse_fine_hdg,
+                pf_east=est_e, pf_north=est_n,
+                pf_spread=pf.weighted_spread(),
+            )
+            if global_corr is not None:
+                pf.apply_global_correction(
+                    global_corr.east_m, global_corr.north_m,
+                    global_corr.heading_deg,
+                    teleport_fraction=trust_config.global_corr_teleport_fraction,
+                    teleport_sigma=trust_config.global_corr_teleport_sigma,
+                )
+                print(f"  [GLOBAL_CORRECTION] Teleported to ({global_corr.east_m:.1f}, "
+                      f"{global_corr.north_m:.1f}) dist={global_corr.distance_from_pf_m:.1f}m "
+                      f"inliers={global_corr.inliers_median} "
+                      f"n_frames={global_corr.n_consistent_frames}")
+
             # Resample + transitions
             pf.resample_if_needed()
             pf.check_transitions()
@@ -601,6 +635,8 @@ def run_replay(
                 "drift_detected": frame_trust.drift_detected if frame_trust else False,
                 "n_fine_candidates": len(frame_trust.all_scores) if frame_trust else 0,
                 "recon_sim_ema": frame_trust.recon_sim_ema if frame_trust else 0.0,
+                "global_correction": global_corr is not None,
+                "recon_diverge_count": trust_tracker._recon_diverge_count,
             })
 
             # Build cache frame (v2: includes all fine candidates + trust signals)
@@ -870,6 +906,42 @@ def _replay_from_cache(
             else:
                 fine_attempted += 1
 
+        # --- Global correction from cached coarse-patch fine ---
+        global_corr = None
+        recon_sim_cache = frame.get("recon_sim", 0.0) if run_fine else 0.0
+        coarse_fine_e_c, coarse_fine_n_c = None, None
+        coarse_fine_inliers_c, coarse_fine_hdg_c = 0, None
+        if run_fine:
+            all_fine_cached_gc = frame.get("all_fine_results", [])
+            for fr in all_fine_cached_gc:
+                src = fr.get("source", fr.get("patch_name", ""))
+                if src not in ("satellite", "mosaic") and fr["inliers"] > 0:
+                    coarse_fine_e_c = fr["east_m"]
+                    coarse_fine_n_c = fr["north_m"]
+                    coarse_fine_inliers_c = fr["inliers"]
+                    coarse_fine_hdg_c = fr.get("heading_deg")
+                    break
+
+        est_e_gc, est_n_gc, _ = pf.estimate()
+        global_corr = trust_tracker.evaluate_global_correction(
+            recon_sim=recon_sim_cache,
+            coarse_fine_east=coarse_fine_e_c,
+            coarse_fine_north=coarse_fine_n_c,
+            coarse_fine_inliers=coarse_fine_inliers_c,
+            coarse_fine_heading=coarse_fine_hdg_c,
+            pf_east=est_e_gc, pf_north=est_n_gc,
+            pf_spread=pf.weighted_spread(),
+        )
+        if global_corr is not None:
+            pf.apply_global_correction(
+                global_corr.east_m, global_corr.north_m,
+                global_corr.heading_deg,
+                teleport_fraction=trust_config.global_corr_teleport_fraction,
+                teleport_sigma=trust_config.global_corr_teleport_sigma,
+            )
+            print(f"  [{bag_name}|cache|GLOBAL_CORRECTION] dist={global_corr.distance_from_pf_m:.1f}m "
+                  f"inliers={global_corr.inliers_median} n_frames={global_corr.n_consistent_frames}")
+
         pf.resample_if_needed()
         pf.check_transitions()
 
@@ -896,6 +968,8 @@ def _replay_from_cache(
             "state": pf.phase.name,
             "fine_source": "",
             "fine_inliers": 0,
+            "global_correction": global_corr is not None,
+            "recon_diverge_count": trust_tracker._recon_diverge_count,
         })
 
     return _finalize_results(results, output_csv, output_plot, t_start_ns,
