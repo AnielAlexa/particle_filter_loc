@@ -43,6 +43,48 @@ class FineResult:
     mkpts_drone: Optional[np.ndarray] = None   # [M,2] keypoints in drone frame (320px)
     mkpts_patch: Optional[np.ndarray] = None   # [M,2] keypoints in patch pixel space
     H: Optional[np.ndarray] = None             # homography: drone(320) → patch(320) matcher space
+    # Flow geometry metrics (computed from matched keypoints)
+    flow_consistency: float = 0.0   # circular resultant R of flow angles [0,1]
+    flow_magnitude_cv: float = 1.0  # coefficient of variation of flow magnitudes
+    inlier_ratio: float = 0.0       # inliers / total_confident_matches
+    flow_heading_deg: Optional[float] = None  # dominant flow direction (degrees)
+    n_total_matches: int = 0        # confidence-filtered matches before RANSAC
+
+
+def compute_flow_metrics(
+    mkpts_drone: np.ndarray, mkpts_patch: np.ndarray,
+) -> dict:
+    """Compute geometric quality metrics from matched keypoint pairs.
+
+    Both arrays are [N, 2] in pixel coordinates (matcher resolution space).
+    Computes on pre-RANSAC confidence-filtered matches for maximum signal.
+    """
+    if mkpts_drone is None or mkpts_patch is None or len(mkpts_drone) < 3:
+        return {"flow_consistency": 0.0, "flow_magnitude_cv": 1.0,
+                "flow_heading_deg": None}
+
+    flow = mkpts_patch - mkpts_drone  # [N, 2]
+    angles = np.arctan2(flow[:, 1], flow[:, 0])
+    magnitudes = np.linalg.norm(flow, axis=1)
+
+    # Flow consistency: circular resultant length R
+    mean_sin = np.mean(np.sin(angles))
+    mean_cos = np.mean(np.cos(angles))
+    R = float(np.sqrt(mean_sin**2 + mean_cos**2))  # [0, 1]
+
+    # Flow magnitude coefficient of variation
+    mag_mean = float(np.mean(magnitudes))
+    mag_std = float(np.std(magnitudes))
+    cv = mag_std / max(mag_mean, 1e-6)
+
+    # Dominant flow direction
+    flow_heading = float(np.degrees(np.arctan2(mean_sin, mean_cos))) % 360.0
+
+    return {
+        "flow_consistency": R,
+        "flow_magnitude_cv": cv,
+        "flow_heading_deg": flow_heading,
+    }
 
 
 def _import_match_module(script_dir: str):
@@ -328,11 +370,15 @@ class ObservationModel:
             return None
 
         mask = mconf > self.fine_conf_threshold
-        if mask.sum() < self.min_inliers_ransac:
+        n_total_matches = int(mask.sum())
+        if n_total_matches < self.min_inliers_ransac:
             return None
 
         mkpts0 = mkpts0[mask]
         mkpts1 = mkpts1[mask]
+
+        # Compute flow geometry metrics on pre-RANSAC confidence-filtered matches
+        flow_metrics = compute_flow_metrics(mkpts0, mkpts1)
 
         # Scale patch keypoints to composite pixel space
         mkpts1_patch = mkpts1 * np.array([[patch_w / res, patch_h / res]], dtype=np.float32)
@@ -382,6 +428,11 @@ class ObservationModel:
             heading_deg=heading_deg, patch_name=patch_name,
             mkpts_drone=vis0, mkpts_patch=vis1,
             H=None,
+            flow_consistency=flow_metrics["flow_consistency"],
+            flow_magnitude_cv=flow_metrics["flow_magnitude_cv"],
+            inlier_ratio=inliers / max(n_total_matches, 1),
+            flow_heading_deg=flow_metrics["flow_heading_deg"],
+            n_total_matches=n_total_matches,
         )
 
     def fine_match_on_mosaic(
@@ -426,11 +477,15 @@ class ObservationModel:
             return None
 
         mask = mconf > self.fine_conf_threshold
-        if mask.sum() < self.min_inliers_ransac:
+        n_total_matches = int(mask.sum())
+        if n_total_matches < self.min_inliers_ransac:
             return None
 
         mkpts0 = mkpts0[mask]
         mkpts1 = mkpts1[mask]
+
+        # Compute flow geometry metrics on pre-RANSAC confidence-filtered matches
+        flow_metrics = compute_flow_metrics(mkpts0, mkpts1)
 
         # Scale keypoints from matcher res to mosaic pixel space (rotated)
         mkpts1_rot = mkpts1 * np.array([[mw / res, mh / res]], dtype=np.float32)
@@ -520,6 +575,11 @@ class ObservationModel:
             heading_deg=heading_deg_out, patch_name="mosaic",
             mkpts_drone=vis0, mkpts_patch=vis1,
             H=None,
+            flow_consistency=flow_metrics["flow_consistency"],
+            flow_magnitude_cv=flow_metrics["flow_magnitude_cv"],
+            inlier_ratio=inliers / max(n_total_matches, 1),
+            flow_heading_deg=flow_metrics["flow_heading_deg"],
+            n_total_matches=n_total_matches,
         )
 
     def fine_match_on_satellite(
@@ -561,11 +621,15 @@ class ObservationModel:
             return None
 
         mask = mconf > self.fine_conf_threshold
-        if mask.sum() < self.min_inliers_ransac:
+        n_total_matches = int(mask.sum())
+        if n_total_matches < self.min_inliers_ransac:
             return None
 
         mkpts0 = mkpts0[mask]
         mkpts1 = mkpts1[mask]
+
+        # Compute flow geometry metrics on pre-RANSAC confidence-filtered matches
+        flow_metrics = compute_flow_metrics(mkpts0, mkpts1)
 
         # Scale keypoints from matcher res to satellite_crop pixel space
         mkpts1_sat = mkpts1 * np.array([[sw / res, sh / res]], dtype=np.float32)
@@ -644,6 +708,11 @@ class ObservationModel:
             heading_deg=heading_deg, patch_name="satellite",
             mkpts_drone=vis0, mkpts_patch=vis1,
             H=None,
+            flow_consistency=flow_metrics["flow_consistency"],
+            flow_magnitude_cv=flow_metrics["flow_magnitude_cv"],
+            inlier_ratio=inliers / max(n_total_matches, 1),
+            flow_heading_deg=flow_metrics["flow_heading_deg"],
+            n_total_matches=n_total_matches,
         )
 
     # ------------------------------------------------------------------

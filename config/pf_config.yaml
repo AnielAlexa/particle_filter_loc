@@ -52,14 +52,16 @@ trust:
   sim_floor: 0.10
   sim_ceiling: 0.55
   sim_weight: 0.20
-  consistency_weight: 0.15
+  consistency_weight: 0.10
   consistency_min_radius_m: 30.0
-  agreement_weight: 0.10
+  agreement_weight: 0.05
   agreement_scale_m: 40.0
   altitude_weight: 0.10
   altitude_ref_m: 60.0
-  temporal_weight: 0.10
+  temporal_weight: 0.05
   temporal_max_speed_m_s: 15.0
+  # Signal 7: Inlier flow geometry
+  geometry_weight: 0.15
   # Sigma modulation
   sigma_min_scale: 0.5
   sigma_max_scale: 3.0

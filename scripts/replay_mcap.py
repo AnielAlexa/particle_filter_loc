@@ -526,18 +526,39 @@ def run_replay(
                 if sat_fine is not None:
                     fe_s, fn_s = enu.wgs84_to_enu(sat_fine.lat, sat_fine.lon)
                     if np.isfinite(fe_s) and np.isfinite(fn_s):
-                        all_fine.append((fe_s, fn_s, sat_fine.inliers,
-                                        sat_fine.heading_deg, "satellite"))
+                        all_fine.append({
+                            "east_m": fe_s, "north_m": fn_s,
+                            "inliers": sat_fine.inliers,
+                            "heading_deg": sat_fine.heading_deg,
+                            "source": "satellite",
+                            "flow_consistency": sat_fine.flow_consistency,
+                            "flow_magnitude_cv": sat_fine.flow_magnitude_cv,
+                            "inlier_ratio": sat_fine.inlier_ratio,
+                        })
                 if mosaic_fine is not None:
                     fe_m, fn_m = enu.wgs84_to_enu(mosaic_fine.lat, mosaic_fine.lon)
                     if np.isfinite(fe_m) and np.isfinite(fn_m):
-                        all_fine.append((fe_m, fn_m, mosaic_fine.inliers,
-                                        mosaic_fine.heading_deg, "mosaic"))
+                        all_fine.append({
+                            "east_m": fe_m, "north_m": fn_m,
+                            "inliers": mosaic_fine.inliers,
+                            "heading_deg": mosaic_fine.heading_deg,
+                            "source": "mosaic",
+                            "flow_consistency": mosaic_fine.flow_consistency,
+                            "flow_magnitude_cv": mosaic_fine.flow_magnitude_cv,
+                            "inlier_ratio": mosaic_fine.inlier_ratio,
+                        })
                 if patch_fine is not None:
                     fe_p, fn_p = enu.wgs84_to_enu(patch_fine.lat, patch_fine.lon)
                     if np.isfinite(fe_p) and np.isfinite(fn_p):
-                        all_fine.append((fe_p, fn_p, patch_fine.inliers,
-                                        patch_fine.heading_deg, coarse.top_k_names[0]))
+                        all_fine.append({
+                            "east_m": fe_p, "north_m": fn_p,
+                            "inliers": patch_fine.inliers,
+                            "heading_deg": patch_fine.heading_deg,
+                            "source": coarse.top_k_names[0],
+                            "flow_consistency": patch_fine.flow_consistency,
+                            "flow_magnitude_cv": patch_fine.flow_magnitude_cv,
+                            "inlier_ratio": patch_fine.inlier_ratio,
+                        })
 
                 frame_trust = trust_tracker.evaluate_frame(
                     fine_candidates=all_fine,
@@ -656,6 +677,7 @@ def run_replay(
                 "agreement_score": _best_cs.agreement_score if _best_cs else 0.0,
                 "altitude_score": _best_cs.altitude_score if _best_cs else 0.0,
                 "temporal_score": _best_cs.temporal_score if _best_cs else 0.0,
+                "geometry_score": _best_cs.geometry_score if _best_cs else 0.0,
                 "recon_sim": recon_sim,
                 "top1_sim": top1_sim,
                 "coarse_gap": coarse_gap,
@@ -691,6 +713,11 @@ def run_replay(
                         "method": sat_fine.method,
                         "patch_name": sat_fine.patch_name,
                         "source": "satellite",
+                        "flow_consistency": sat_fine.flow_consistency,
+                        "flow_magnitude_cv": sat_fine.flow_magnitude_cv,
+                        "inlier_ratio": sat_fine.inlier_ratio,
+                        "flow_heading_deg": sat_fine.flow_heading_deg,
+                        "n_total_matches": sat_fine.n_total_matches,
                     })
                 if mosaic_fine is not None:
                     _fe, _fn = enu.wgs84_to_enu(mosaic_fine.lat, mosaic_fine.lon)
@@ -701,6 +728,11 @@ def run_replay(
                         "method": mosaic_fine.method,
                         "patch_name": mosaic_fine.patch_name,
                         "source": "mosaic",
+                        "flow_consistency": mosaic_fine.flow_consistency,
+                        "flow_magnitude_cv": mosaic_fine.flow_magnitude_cv,
+                        "inlier_ratio": mosaic_fine.inlier_ratio,
+                        "flow_heading_deg": mosaic_fine.flow_heading_deg,
+                        "n_total_matches": mosaic_fine.n_total_matches,
                     })
                 if patch_fine is not None:
                     _fe, _fn = enu.wgs84_to_enu(patch_fine.lat, patch_fine.lon)
@@ -711,6 +743,11 @@ def run_replay(
                         "method": patch_fine.method,
                         "patch_name": patch_fine.patch_name,
                         "source": coarse.top_k_names[0],
+                        "flow_consistency": patch_fine.flow_consistency,
+                        "flow_magnitude_cv": patch_fine.flow_magnitude_cv,
+                        "inlier_ratio": patch_fine.inlier_ratio,
+                        "flow_heading_deg": patch_fine.flow_heading_deg,
+                        "n_total_matches": patch_fine.n_total_matches,
                     })
                 cache_frames.append({
                     "timestamp_ns": ts_ns,
@@ -757,7 +794,7 @@ def run_replay(
     # ---- Write cache ----
     if save_cache and cache_frames:
         header = {
-            "__cache_version__": 2,
+            "__cache_version__": 3,
             "bag_name": bag_name,
             "mcap_path": mcap_path,
             "start_offset_s": start_offset_s,
@@ -893,19 +930,28 @@ def _replay_from_cache(
 
             fine_candidates = []
             for fr in all_fine_cached:
-                fine_candidates.append((
-                    fr["east_m"], fr["north_m"], fr["inliers"],
-                    fr.get("heading_deg"), fr.get("source", fr.get("patch_name", "")),
-                ))
+                fine_candidates.append({
+                    "east_m": fr["east_m"],
+                    "north_m": fr["north_m"],
+                    "inliers": fr["inliers"],
+                    "heading_deg": fr.get("heading_deg"),
+                    "source": fr.get("source", fr.get("patch_name", "")),
+                    "flow_consistency": fr.get("flow_consistency", 0.0),
+                    "flow_magnitude_cv": fr.get("flow_magnitude_cv", 1.0),
+                    "inlier_ratio": fr.get("inlier_ratio", 0.0),
+                })
 
             # Fallback for v1 caches
             if not fine_candidates:
                 fc = frame.get("fine_result")
                 if fc:
-                    fine_candidates.append((
-                        fc["east_m"], fc["north_m"], fc["inliers"],
-                        fc.get("heading_deg"), fc.get("method", ""),
-                    ))
+                    fine_candidates.append({
+                        "east_m": fc["east_m"],
+                        "north_m": fc["north_m"],
+                        "inliers": fc["inliers"],
+                        "heading_deg": fc.get("heading_deg"),
+                        "source": fc.get("method", ""),
+                    })
 
             if fine_candidates:
                 fine_attempted += 1

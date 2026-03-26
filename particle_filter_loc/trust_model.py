@@ -22,17 +22,19 @@ class TrustConfig:
     sim_ceiling: float = 0.55
     sim_weight: float = 0.20
     # Signal 3: PF consistency
-    consistency_weight: float = 0.15
+    consistency_weight: float = 0.10
     consistency_min_radius_m: float = 30.0
     # Signal 4: Cross-agreement
-    agreement_weight: float = 0.10
+    agreement_weight: float = 0.05
     agreement_scale_m: float = 40.0
     # Signal 5: Altitude
     altitude_weight: float = 0.10
     altitude_ref_m: float = 60.0
     # Signal 6: Temporal consistency
-    temporal_weight: float = 0.10
+    temporal_weight: float = 0.05
     temporal_max_speed_m_s: float = 15.0
+    # Signal 7: Inlier flow geometry
+    geometry_weight: float = 0.15
     # Sigma modulation
     sigma_min_scale: float = 1.0
     sigma_max_scale: float = 5.0
@@ -85,6 +87,7 @@ class CandidateScore:
     agreement_score: float = 0.0
     altitude_score: float = 0.0
     temporal_score: float = 0.0
+    geometry_score: float = 0.0
     # Combined
     confidence: float = 0.0
 
@@ -130,6 +133,9 @@ def score_candidate(
     prev_best_enu: Optional[Tuple[float, float]],
     dt_s: float,
     cfg: TrustConfig,
+    flow_consistency: float = 0.0,
+    flow_magnitude_cv: float = 1.0,
+    inlier_ratio: float = 0.0,
 ) -> CandidateScore:
     cs = CandidateScore(
         east_m=east_m, north_m=north_m, inliers=inliers,
@@ -181,6 +187,28 @@ def score_candidate(
         scale = max(max_move * 2.0, 10.0)
         cs.temporal_score = math.exp(-0.5 * (dt_dist / scale) ** 2)
 
+    # Signal 7: Inlier flow geometry — coherence of displacement vectors
+    # flow_consistency: R ∈ [0,1], 1 = perfectly parallel (correct match)
+    # flow_magnitude_cv: coefficient of variation, lower = more consistent
+    # inlier_ratio: inliers/total, higher = RANSAC barely needed to filter
+    #
+    # For satellite/mosaic: images ARE aligned to drone FOV, so high flow
+    # consistency (parallel vectors) is expected for correct matches.
+    # For coarse patches: images are NOT aligned, so flow has perspective/
+    # rotation components. We rely more on inlier_ratio and magnitude CV,
+    # less on flow direction consistency.
+    if flow_consistency > 0.0 or inlier_ratio > 0.0:
+        mag_score = 1.0 / (1.0 + flow_magnitude_cv)
+        if source in ("satellite", "mosaic"):
+            # Aligned images: flow consistency is the primary geometry signal
+            cs.geometry_score = flow_consistency * mag_score * (0.5 + 0.5 * inlier_ratio)
+        else:
+            # Unaligned (coarse patch): flow direction less meaningful,
+            # rely on inlier_ratio and magnitude consistency
+            cs.geometry_score = mag_score * (0.3 + 0.7 * inlier_ratio)
+    else:
+        cs.geometry_score = 0.3  # neutral when no geometry data available
+
     # Combined: weighted geometric mean
     signals = [
         (cs.inlier_score, cfg.inlier_weight),
@@ -189,6 +217,7 @@ def score_candidate(
         (cs.agreement_score, cfg.agreement_weight),
         (cs.altitude_score, cfg.altitude_weight),
         (cs.temporal_score, cfg.temporal_weight),
+        (cs.geometry_score, cfg.geometry_weight),
     ]
     log_conf = sum(w * math.log(max(s, 1e-10)) for s, w in signals)
     cs.confidence = math.exp(log_conf)
@@ -227,7 +256,7 @@ class TrustTracker:
 
     def evaluate_frame(
         self,
-        fine_candidates: List[Tuple],
+        fine_candidates: List,
         recon_sim: float,
         top1_sim: float,
         pf_east: float,
@@ -239,7 +268,10 @@ class TrustTracker:
     ) -> FrameTrust:
         """Evaluate all fine candidates for a frame.
 
-        fine_candidates: list of (east_m, north_m, inliers, heading_deg, source) tuples
+        fine_candidates: list of dicts with keys:
+            east_m, north_m, inliers, heading_deg, source,
+            flow_consistency (opt), flow_magnitude_cv (opt), inlier_ratio (opt)
+        Also accepts legacy 5-tuples: (east_m, north_m, inliers, heading_deg, source)
         """
         # Update EMAs
         self.recon_sim_ema = self._ema(self.recon_sim_ema, recon_sim)
@@ -259,8 +291,20 @@ class TrustTracker:
         if self.prev_best_ts is not None:
             dt_s = timestamp_s - self.prev_best_ts
 
+        # Normalize candidates to dicts (support legacy 5-tuples)
+        candidates = []
+        for c in fine_candidates:
+            if isinstance(c, dict):
+                candidates.append(c)
+            else:
+                # Legacy 5-tuple: (east_m, north_m, inliers, heading_deg, source)
+                candidates.append({
+                    "east_m": c[0], "north_m": c[1], "inliers": c[2],
+                    "heading_deg": c[3], "source": c[4],
+                })
+
         # Build list of all candidate positions for cross-agreement
-        all_enu = [(e, n) for e, n, _, _, _ in fine_candidates]
+        all_enu = [(c["east_m"], c["north_m"]) for c in candidates]
 
         result = FrameTrust(
             drift_detected=drift_detected,
@@ -268,7 +312,12 @@ class TrustTracker:
             pf_self_confidence_ema=self.pf_self_confidence_ema,
         )
 
-        for e, n, inliers, hdg, source in fine_candidates:
+        for c in candidates:
+            e, n = c["east_m"], c["north_m"]
+            inliers = c["inliers"]
+            hdg = c.get("heading_deg")
+            source = c["source"]
+
             # When drift detected, drop mosaic/satellite candidates
             if drift_detected and source in ("satellite", "mosaic"):
                 continue
@@ -295,6 +344,9 @@ class TrustTracker:
                 prev_best_enu=self.prev_best_enu,
                 dt_s=dt_s,
                 cfg=self.cfg,
+                flow_consistency=c.get("flow_consistency", 0.0),
+                flow_magnitude_cv=c.get("flow_magnitude_cv", 1.0),
+                inlier_ratio=c.get("inlier_ratio", 0.0),
             )
             result.all_scores.append(cs)
 
