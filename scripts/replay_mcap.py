@@ -192,6 +192,10 @@ def run_replay(
     topics = [camera_topic, rtk_topic, yaw_topic, altimeter_topic]
 
     print(f"[{bag_name}] Starting replay...")
+    _dbg_first_msg = True
+    _dbg_offset_done = False
+    _dbg_alt_init_printed = False
+    _dbg_camera_count = 0
 
     for schema, channel, message, decoded_msg in reader.iter_decoded_messages(topics=topics):
         topic = channel.topic
@@ -202,20 +206,36 @@ def run_replay(
 
         elapsed_s = (ts_ns - t_start) * 1e-9
 
+        if _dbg_first_msg:
+            print(f"  [DBG] First message at {elapsed_s:.1f}s  topic={topic}")
+            _dbg_first_msg = False
+
         # Skip messages before start offset
         if elapsed_s < start_offset_s:
             continue
+
+        if not _dbg_offset_done:
+            print(f"  [DBG] Past start_offset_s={start_offset_s}s at elapsed={elapsed_s:.1f}s")
+            _dbg_offset_done = True
 
         # --- Altimeter ---
         if topic == altimeter_topic:
             alt = float(decoded_msg.range)
             altitude_buf.append(alt)
             current_altitude_m = float(np.median(altitude_buf)) if altitude_buf else alt
+            if not initialized and not _dbg_alt_init_printed:
+                print(f"  [DBG] Altimeter: alt={alt:.1f}m  median={current_altitude_m:.1f}m  "
+                      f"buf_len={len(altitude_buf)}/5  need>{pf_config.init_altitude_m}m")
             if not initialized and len(altitude_buf) >= 5:
                 if pf.try_init(current_altitude_m):
                     initialized = True
+                    _dbg_alt_init_printed = True
                     print(f"  [{bag_name}] Altitude init: median={current_altitude_m:.1f}m "
                           f"> {pf_config.init_altitude_m}m")
+                elif not _dbg_alt_init_printed and len(altitude_buf) >= 5:
+                    print(f"  [DBG] Altimeter buf full but median={current_altitude_m:.1f}m "
+                          f"< {pf_config.init_altitude_m}m, waiting...")
+                    _dbg_alt_init_printed = True  # only print once
             continue
 
         # --- Yaw ---
@@ -261,7 +281,10 @@ def run_replay(
 
         # --- Camera ---
         if topic == camera_topic:
+            _dbg_camera_count += 1
             if not initialized:
+                if _dbg_camera_count <= 3:
+                    print(f"  [DBG] Camera frame #{_dbg_camera_count} at {elapsed_s:.1f}s — skipped (not initialized)")
                 continue
 
             camera_frame_idx += 1
@@ -274,6 +297,9 @@ def run_replay(
 
             # --- Altitude gating ---
             if altitude_min_m > 0.0 and current_altitude_m < altitude_min_m:
+                if camera_frame_idx <= 3:
+                    print(f"  [DBG] Camera frame #{camera_frame_idx} at {elapsed_s:.1f}s — "
+                          f"altitude gated (alt={current_altitude_m:.1f}m < {altitude_min_m}m)")
                 if save_cache:
                     cache_frames.append({
                         "timestamp_ns": ts_ns,
@@ -528,8 +554,10 @@ def run_replay(
                     best_cs = frame_trust.best
                     fine_result = best_cs  # for logging below
                     eff_sigma = trust_tracker.get_effective_sigma(
-                        best_cs.confidence, pf_config.sigma_obs_fine)
-                    eff_kappa = trust_tracker.get_effective_kappa(best_cs.confidence)
+                        best_cs.confidence, pf_config.sigma_obs_fine,
+                        is_static=pf.is_static)
+                    eff_kappa = trust_tracker.get_effective_kappa(
+                        best_cs.confidence, is_static=pf.is_static)
                     viz.fine_matched_name = best_cs.source
                     viz.footprint_confidence = best_cs.confidence
 
@@ -855,8 +883,8 @@ def _replay_from_cache(
                     teleport_sigma_override=tp_sigma,
                 )
 
-        # Fine update with trust model
-        run_fine = pf.should_run_fine()
+        # Fine update with trust model (skip while static before first motion)
+        run_fine = pf.should_run_fine() and pf._motion_detected
         if run_fine:
             # Build candidates from cache
             all_fine_cached = frame.get("all_fine_results", [])
@@ -894,8 +922,10 @@ def _replay_from_cache(
                 )
                 if ft.best is not None:
                     eff_sigma = trust_tracker.get_effective_sigma(
-                        ft.best.confidence, pf_config.sigma_obs_fine)
-                    eff_kappa = trust_tracker.get_effective_kappa(ft.best.confidence)
+                        ft.best.confidence, pf_config.sigma_obs_fine,
+                        is_static=pf.is_static)
+                    eff_kappa = trust_tracker.get_effective_kappa(
+                        ft.best.confidence, is_static=pf.is_static)
                     pf.update_fine(
                         ft.best.east_m, ft.best.north_m, ft.best.inliers,
                         ft.best.heading_deg,

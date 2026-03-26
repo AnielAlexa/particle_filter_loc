@@ -316,15 +316,24 @@ class TrustTracker:
         # confidence=0 -> sigma_max_scale, confidence=1 -> sigma_min_scale
         return 1.0 / (0.2 + 0.8 * confidence)
 
-    def get_effective_sigma(self, confidence: float, base_sigma: float) -> float:
+    def get_effective_sigma(self, confidence: float, base_sigma: float,
+                            is_static: bool = False) -> float:
         scale = self.get_sigma_scale(confidence)
         # Cap sigma scale during drift
         if scale > self.cfg.drift_sigma_cap and self.pf_self_confidence_ema < self.cfg.drift_pf_confidence_threshold:
             scale = self.cfg.drift_sigma_cap
-        return base_sigma * _clamp(scale, self.cfg.sigma_min_scale, self.cfg.sigma_max_scale)
+        sigma = base_sigma * _clamp(scale, self.cfg.sigma_min_scale, self.cfg.sigma_max_scale)
+        # When static: widen sigma so fine matches inform but don't jerk the PF
+        if is_static:
+            sigma = max(sigma, base_sigma * 2.0)
+        return sigma
 
-    def get_effective_kappa(self, confidence: float) -> float:
-        return 15.0 * confidence
+    def get_effective_kappa(self, confidence: float, is_static: bool = False) -> float:
+        kappa = 15.0 * confidence
+        # When static: reduce heading pull (same image = noisy heading estimates)
+        if is_static:
+            kappa *= 0.3
+        return kappa
 
     def evaluate_global_correction(
         self,

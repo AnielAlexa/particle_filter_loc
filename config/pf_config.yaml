@@ -23,7 +23,7 @@ particle_filter:
   sigma_obs_fine: 5.0            # tighter fine now that PnP bias is fixed
   top_k_coarse: 5
   ess_threshold_fraction: 0.5
-  init_altitude_m: 50.0          # only init when high enough for VPR
+  init_altitude_m: 50.0          # match altitude_min_process_m; RTK-init doesn't need VPR
   converge_spread_m: 40.0        # enter CONVERGING earlier
   tracking_spread_m: 20.0        # enter TRACKING earlier
   lost_spread_m: 150.0
@@ -38,6 +38,9 @@ particle_filter:
   altitude_sigma_enabled: false
   altitude_sigma_ref_m: 60.0
   altitude_sigma_scale: 0.5
+  # Static detection: suppress noise when hovering
+  static_threshold_m: 0.15         # RTK delta below this = static
+  static_sigma_scale: 0.1          # process noise multiplier when static
   # Fine match consistency gate (0 = disabled)
   fine_consistency_max_m: 20.0     # reject fine matches > 20m from PF estimate
   fine_force_inliers: 0             # disabled
@@ -131,13 +134,13 @@ init:
   lock_sim_threshold: 0.3  # minimum sim to count as a hit
 
 replay:
-  mcap_path: "/media/aniel/storage/bags_jetson/ec18bbfeef98b595877beeeb05666d33/Bag5.2_0.mcap"
+  mcap_path: "/media/aniel/storage/bags_jetson/095c6d2c7237fe986c6240628b6ef8dd/Day2.6_0.mcap"
   camera_topic: "/camera/image_mono"
   rtk_topic: "/m300/rtk/fix"
   yaw_topic: "/m300/rtk/yaw"
   altimeter_topic: "/altimeter/range"
-  start_offset_s: 80.0        # skip this many seconds from bag start
+  start_offset_s: 50.0        # skip this many seconds from bag start
   camera_subsample: 1
-  altitude_min_process_m: 45.0  # skip camera frames if median altitude below this
+  altitude_min_process_m: 50.0  # skip camera frames if median altitude below this
   output_csv: "results/pf_results.csv"
   output_plot: "results/pf_trajectory.png"

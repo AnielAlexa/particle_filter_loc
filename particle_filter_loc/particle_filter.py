@@ -60,6 +60,9 @@ class PFConfig:
     coarse_trust_sim: float = 0.0
     coarse_trust_fraction: float = 0.7   # fraction of particles to inject
     coarse_trust_sigma: float = 20.0     # spatial spread of injected particles (m)
+    # Static detection: reduce process noise when hovering
+    static_threshold_m: float = 0.15     # RTK delta below this = static
+    static_sigma_scale: float = 0.1      # multiply process noise by this when static
 
 
 class ParticleFilter:
@@ -71,6 +74,8 @@ class ParticleFilter:
         self.particles: Optional[np.ndarray] = None  # [N, 3] east, north, heading
         self.weights: Optional[np.ndarray] = None     # [N]
         self._frame_count = 0
+        self.is_static = False
+        self._motion_detected = False  # True once drone has moved since init
 
     # ------------------------------------------------------------------
     # Initialization
@@ -142,16 +147,27 @@ class ParticleFilter:
             sigma_pos = self.cfg.sigma_pos_dispersed
             sigma_hdg = self.cfg.sigma_hdg_dispersed
 
+        # Detect static: near-zero RTK delta → suppress process noise
+        move_m = math.sqrt(delta.dx_m ** 2 + delta.dy_m ** 2)
+        self.is_static = move_m < self.cfg.static_threshold_m
+        if not self.is_static:
+            self._motion_detected = True
+        is_static = self.is_static
+        if is_static:
+            sigma_pos *= self.cfg.static_sigma_scale
+            sigma_hdg *= self.cfg.static_sigma_scale
+
         self.particles[:, 0] += delta.dx_m + self.rng.normal(0, sigma_pos, n)
         self.particles[:, 1] += delta.dy_m + self.rng.normal(0, sigma_pos, n)
         self.particles[:, 2] = delta.heading_deg + self.rng.normal(0, sigma_hdg, n)
 
         # Drift noise: accumulates over time, simulates VIO-like uncertainty
-        if self.cfg.drift_noise_m_per_s > 0.0 and delta.dt_s > 0.0:
+        # Skip when static — no motion means no drift
+        if not is_static and self.cfg.drift_noise_m_per_s > 0.0 and delta.dt_s > 0.0:
             drift_sigma = self.cfg.drift_noise_m_per_s * math.sqrt(delta.dt_s)
             self.particles[:, 0] += self.rng.normal(0, drift_sigma, n)
             self.particles[:, 1] += self.rng.normal(0, drift_sigma, n)
-        if self.cfg.drift_noise_hdg_per_s > 0.0 and delta.dt_s > 0.0:
+        if not is_static and self.cfg.drift_noise_hdg_per_s > 0.0 and delta.dt_s > 0.0:
             hdg_sigma = self.cfg.drift_noise_hdg_per_s * math.sqrt(delta.dt_s)
             self.particles[:, 2] += self.rng.normal(0, hdg_sigma, n)
 
