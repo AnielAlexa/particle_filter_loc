@@ -82,6 +82,7 @@ class ParticleFilter:
         self._frame_count = 0
         self.is_static = False
         self._motion_detected = False  # True once drone has moved since init
+        self._cov_sigma_ema: float = 100.0  # EMA-smoothed covariance sigma
 
     # ------------------------------------------------------------------
     # Initialization
@@ -523,6 +524,50 @@ class ParticleFilter:
         cos_mean = np.average(np.cos(rad), weights=self.weights)
         heading = math.degrees(math.atan2(sin_mean, cos_mean)) % 360.0
         return float(east), float(north), float(heading)
+
+    def estimate_covariance(self, trust_confidence: float = 0.5) -> Tuple[float, np.ndarray]:
+        """GPS-like measurement covariance for EKF fusion.
+
+        Returns (sigma_m, R_2x2) where sigma_m is the EMA-smoothed 1-sigma
+        position uncertainty in meters and R_2x2 is the 2x2 diagonal
+        covariance matrix.
+
+        Combines particle spread, ESS, trust confidence, and phase into
+        a single uncertainty estimate suitable as measurement noise covariance
+        in an EKF that fuses PF output with VIO.  EMA-smoothed to avoid
+        frame-to-frame jitter.
+        """
+        if self.particles is None:
+            sigma = 100.0
+            self._cov_sigma_ema = sigma
+            return sigma, np.diag([sigma**2, sigma**2])
+
+        spread = self.weighted_spread()
+        ess_ratio = self.effective_sample_size() / len(self.particles)
+
+        # Base variance from particle spread (minimum 3m)
+        sigma = max(spread, 3.0)
+
+        # Inflate when ESS is low (particle depletion -> less trustworthy)
+        sigma /= max(ess_ratio, 0.3)
+
+        # Deflate when trust confidence is high (good visual match)
+        sigma *= (1.5 - trust_confidence)  # range [0.5x, 1.5x]
+
+        # Phase gate: don't trust non-tracking states
+        if self.phase == Phase.DISPERSED:
+            sigma = max(sigma, 100.0)
+        elif self.phase == Phase.CONVERGING:
+            sigma = max(sigma, 30.0)
+
+        # EMA smoothing: fast rise (alpha=0.5) to react to problems,
+        # slow fall (alpha=0.15) for visual stability
+        alpha = 0.5 if sigma > self._cov_sigma_ema else 0.15
+        self._cov_sigma_ema = alpha * sigma + (1.0 - alpha) * self._cov_sigma_ema
+
+        sigma_out = self._cov_sigma_ema
+        R = np.diag([sigma_out**2, sigma_out**2])
+        return float(sigma_out), R
 
     def should_run_fine(self) -> bool:
         self._frame_count += 1

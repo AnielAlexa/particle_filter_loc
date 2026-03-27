@@ -124,8 +124,13 @@ def _build_minimap(
     gt_path:  List[Tuple[float, float]],
     pf_path:  List[Tuple[float, float]],
     phase_path: List[Phase],
+    covariance_sigma_m: float = 0.0,
 ) -> np.ndarray:
-    """Draw accumulated RTK (red) and PF (blue) trajectories on a dark canvas."""
+    """Draw accumulated RTK (red) and PF (blue) trajectories on a dark canvas.
+
+    If covariance_sigma_m > 0, draws a semi-transparent circle around the
+    current PF position representing the 1-sigma uncertainty region.
+    """
     w = h = _SZ
     panel = _blank()
 
@@ -153,6 +158,8 @@ def _build_minimap(
         py = int((1.0 - (n - min_n) / span_n) * (h - 1))
         return np.clip(px, 0, w - 1), np.clip(py, 0, h - 1)
 
+    metres_per_px = span_e / w
+
     for frac in [0.25, 0.5, 0.75]:
         gx, gy = int(frac * w), int(frac * h)
         cv2.line(panel, (gx, 0), (gx, h), (35, 35, 35), 1)
@@ -169,6 +176,28 @@ def _build_minimap(
             seg_color = _PHASE_COLOR.get(phase_path[i], _COLOR_PF)
             cv2.line(panel, pts_px[i - 1], pts_px[i], seg_color, 2, cv2.LINE_AA)
 
+    # Covariance circle: semi-transparent around PF position
+    if pf_path and covariance_sigma_m > 0 and metres_per_px > 0:
+        cx, cy = to_px(*pf_path[-1])
+        radius_px = max(int(covariance_sigma_m / metres_per_px), 3)
+        radius_px = min(radius_px, w // 2)  # clamp to panel size
+        # Draw semi-transparent filled circle via overlay blending
+        overlay = panel.copy()
+        # Color: green when small (confident), orange when medium, red when large
+        if covariance_sigma_m < 10.0:
+            circle_color = (0, 180, 0)      # green
+        elif covariance_sigma_m < 25.0:
+            circle_color = (0, 180, 220)    # yellow-orange
+        else:
+            circle_color = (0, 60, 220)     # red
+        cv2.circle(overlay, (cx, cy), radius_px, circle_color, -1, cv2.LINE_AA)
+        cv2.addWeighted(overlay, 0.25, panel, 0.75, 0, panel)
+        # Draw outline
+        cv2.circle(panel, (cx, cy), radius_px, circle_color, 1, cv2.LINE_AA)
+        # Label sigma value
+        _text(panel, [f"s={covariance_sigma_m:.0f}m"], cx + radius_px + 4, cy + 4,
+              scale=0.35, color=circle_color)
+
     if gt_path:
         cx, cy = to_px(*gt_path[-1])
         cv2.circle(panel, (cx, cy), 5, _COLOR_GT_CUR, -1, cv2.LINE_AA)
@@ -182,7 +211,6 @@ def _build_minimap(
     cv2.line(panel, (8, h - 14), (24, h - 14), _COLOR_PF_CUR, 2)
     _text(panel, ["RTK", "PF"], x=28, y0=h - 34, scale=0.38, color=(200, 200, 200))
 
-    metres_per_px = span_e / w
     target_bar_m = max(round(span_e / 4 / 10) * 10, 5.0)
     bar_px = max(int(target_bar_m / metres_per_px), 4)
     bx0, by0 = w - bar_px - 10, 10
@@ -441,8 +469,12 @@ class DebugVisualizer:
         cv2.putText(p_part, "PARTICLES", (4, _SZ - 6), cv2.FONT_HERSHEY_SIMPLEX,
                     0.4, (200, 200, 200), 1, cv2.LINE_AA)
 
-        # Minimap
-        p_mini = _build_minimap(self._gt_path, self._pf_path, self._phase_path)
+        # Minimap with covariance circle
+        cov_sigma = 0.0
+        if pf.particles is not None:
+            cov_sigma, _ = pf.estimate_covariance(self.footprint_confidence)
+        p_mini = _build_minimap(self._gt_path, self._pf_path, self._phase_path,
+                                covariance_sigma_m=cov_sigma)
 
         # Pad row2 to match row1 width
         row2_content = np.hstack([p_sat, gap_v, p_part, gap_v, p_mini])

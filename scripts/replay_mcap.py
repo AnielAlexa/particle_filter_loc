@@ -679,6 +679,7 @@ def run_replay(
                 "altitude_score": _best_cs.altitude_score if _best_cs else 0.0,
                 "temporal_score": _best_cs.temporal_score if _best_cs else 0.0,
                 "geometry_score": _best_cs.geometry_score if _best_cs else 0.0,
+                "covariance_sigma_m": pf.estimate_covariance(_best_cs.confidence if _best_cs else 0.5)[0],
                 "recon_sim": recon_sim,
                 "top1_sim": top1_sim,
                 "coarse_gap": coarse_gap,
@@ -1106,6 +1107,26 @@ def _finalize_results(results, output_csv, output_plot, t_start,
 
     fine_rate_pct = 100.0 * fine_succeeded / max(fine_attempted, 1)
 
+    # Trajectory smoothness: RMS of (PF velocity - GT velocity) per frame
+    # Measures how much the PF trajectory "wiggles" vs the smooth GT path
+    jitter_m = -1.0
+    tracking_results = [r for r in results if r.get("state") == "TRACKING"
+                        and r.get("est_lat") and r.get("gt_lat")
+                        and r["gt_lat"] != 0.0]
+    if len(tracking_results) >= 3:
+        pf_e = np.array([r["est_lat"] for r in tracking_results]) * 111320.0
+        pf_n = np.array([r["est_lon"] for r in tracking_results]) * 111320.0 * 0.7071
+        gt_e = np.array([r["gt_lat"] for r in tracking_results]) * 111320.0
+        gt_n = np.array([r["gt_lon"] for r in tracking_results]) * 111320.0 * 0.7071
+        # Frame-to-frame velocity (position delta)
+        dpf_e = np.diff(pf_e)
+        dpf_n = np.diff(pf_n)
+        dgt_e = np.diff(gt_e)
+        dgt_n = np.diff(gt_n)
+        # Velocity error
+        verr = np.sqrt((dpf_e - dgt_e)**2 + (dpf_n - dgt_n)**2)
+        jitter_m = float(np.sqrt(np.mean(verr**2)))  # RMS
+
     print(f"\n[{bag_name}] === Summary ===")
     if errors:
         errors_np = np.array(errors)
@@ -1121,6 +1142,8 @@ def _finalize_results(results, output_csv, output_plot, t_start,
         print(f"  Time to TRACKING: {converge_s:.1f}s")
     print(f"  Total frames: {len(results)}")
     print(f"  Fine match rate: {fine_succeeded}/{fine_attempted} ({fine_rate_pct:.1f}%)")
+    if jitter_m >= 0:
+        print(f"  Trajectory jitter: {jitter_m:.2f}m RMS")
 
     # Plot
     try:
@@ -1143,6 +1166,7 @@ def _finalize_results(results, output_csv, output_plot, t_start,
         "fine_rate_pct": fine_rate_pct,
         "fine_succeeded": fine_succeeded,
         "fine_attempted": fine_attempted,
+        "jitter_m": jitter_m,
     }
 
 
