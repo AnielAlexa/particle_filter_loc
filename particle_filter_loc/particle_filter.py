@@ -63,6 +63,12 @@ class PFConfig:
     # Static detection: reduce process noise when hovering
     static_threshold_m: float = 0.15     # RTK delta below this = static
     static_sigma_scale: float = 0.1      # multiply process noise by this when static
+    # Roughening: add jitter after resampling to prevent particle collapse
+    roughen_enabled: bool = True
+    roughen_scale: float = 0.5           # h parameter: higher = more jitter
+    # Student-t likelihood: heavier tails prevent outlier observations from
+    # collapsing the particle cloud. Set to large value (>100) for Gaussian.
+    likelihood_nu: float = 5.0
 
 
 class ParticleFilter:
@@ -224,15 +230,21 @@ class ParticleFilter:
         dist_cap = 3.0 * sigma  # particles beyond this get zero likelihood from this patch
         N = len(self.particles)
 
-        # log p(z | x_i) = logsumexp_k [ log(mix_w[k]) - dist²/sigma2 ]
+        # log p(z | x_i) = logsumexp_k [ log(mix_w[k]) + log_lik(dist) ]
         # with distance cap: if dist > 3*sigma, set log_component to -inf
+        nu = self.cfg.likelihood_nu
+        use_student_t = nu < 100.0
         NEG_INF = -1e30
         log_components = np.empty((N, len(filtered)), dtype=np.float64)
         for k, (east, north, _) in enumerate(filtered):
             dx = self.particles[:, 0] - east
             dy = self.particles[:, 1] - north
             dist2 = dx**2 + dy**2
-            lc = np.log(mix_w[k] + 1e-300) - dist2 / sigma2
+            if use_student_t:
+                # Student-t: heavier tails, more outlier-robust
+                lc = np.log(mix_w[k] + 1e-300) - (nu + 2.0) / 2.0 * np.log(1.0 + dist2 / (nu * sigma2))
+            else:
+                lc = np.log(mix_w[k] + 1e-300) - dist2 / sigma2
             lc[dist2 > dist_cap**2] = NEG_INF
             log_components[:, k] = lc
 
@@ -345,7 +357,12 @@ class ParticleFilter:
         dx = self.particles[:, 0] - fine_east
         dy = self.particles[:, 1] - fine_north
         dist2 = dx ** 2 + dy ** 2
-        log_likelihood = -dist2 / sigma2
+        nu = self.cfg.likelihood_nu
+        if nu < 100.0:
+            # Student-t: heavier tails prevent particle collapse from outliers
+            log_likelihood = -(nu + 2.0) / 2.0 * np.log(1.0 + dist2 / (nu * sigma2))
+        else:
+            log_likelihood = -dist2 / sigma2
 
         # Von Mises heading update
         if heading_deg is not None and inliers >= self.cfg.fine_min_inliers_heading:
@@ -428,6 +445,18 @@ class ParticleFilter:
         indices = np.searchsorted(cumsum, positions)
         self.particles = self.particles[indices].copy()
         self.weights = np.full(n, 1.0 / n)
+
+        # Roughening: add small jitter to prevent particle collapse from
+        # duplicate particles after resampling (Musso et al., 2001)
+        if self.cfg.roughen_enabled:
+            h = self.cfg.roughen_scale
+            spread = self.weighted_spread()
+            roughen_pos = max(0.3, h * spread * n ** (-1.0 / 3.0))
+            roughen_hdg = max(0.5, h * 10.0 * n ** (-1.0 / 3.0))
+            self.particles[:, 0] += self.rng.normal(0, roughen_pos, n)
+            self.particles[:, 1] += self.rng.normal(0, roughen_pos, n)
+            self.particles[:, 2] += self.rng.normal(0, roughen_hdg, n)
+            self.particles[:, 2] %= 360.0
 
     # ------------------------------------------------------------------
     # State transitions

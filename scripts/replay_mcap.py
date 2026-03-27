@@ -122,6 +122,7 @@ def run_replay(
             altitude_min_m=altitude_min_m,
             output_csv=str(output_csv),
             output_plot=str(output_plot),
+            rtk_noise_m=rtk_noise_m,
         )
 
     # ---- FULL MCAP REPLAY ----
@@ -823,6 +824,7 @@ def _replay_from_cache(
     altitude_min_m: float,
     output_csv: str,
     output_plot: str,
+    rtk_noise_m: float = 0.0,
 ) -> dict:
     """PF-only replay from a match cache file. No TRT, no MCAP."""
     print(f"[cache] Loading: {cache_path}")
@@ -862,7 +864,15 @@ def _replay_from_cache(
         # Apply RTK deltas (even for gated frames)
         for d in frame.get("rtk_deltas", []):
             if pf.particles is not None:
-                pf.predict(MotionDelta(**d))
+                delta = MotionDelta(**d)
+                if rtk_noise_m > 0.0:
+                    delta = MotionDelta(
+                        dx_m=delta.dx_m + np.random.normal(0, rtk_noise_m),
+                        dy_m=delta.dy_m + np.random.normal(0, rtk_noise_m),
+                        heading_deg=delta.heading_deg + np.random.normal(0, rtk_noise_m * 2.0),
+                        dt_s=delta.dt_s,
+                    )
+                pf.predict(delta)
 
         if frame.get("gated_out"):
             continue
@@ -877,11 +887,18 @@ def _replay_from_cache(
             else:
                 continue
 
+        # RTK-init: seed PF from GT position (mirrors live RTK-init path)
+        if pf.phase == Phase.UNINIT and gt_lat != 0.0 and gt_lon != 0.0:
+            rtk_e, rtk_n = enu.wgs84_to_enu(gt_lat, gt_lon)
+            pf.seed_from_position(rtk_e, rtk_n, heading_deg=0.0,
+                                  sigma_pos=5.0, sigma_hdg=10.0)
+            print(f"  [{bag_name}|cache] RTK-init: seeded at ({gt_lat:.6f}, {gt_lon:.6f})")
+
         coarse_names = frame.get("coarse_top_k_names", [])
         coarse_sims  = frame.get("coarse_top_k_sims",  [])
         coarse_enu   = frame.get("coarse_top_k_enu",   [])
 
-        # Pre-seed lock logic
+        # Pre-seed lock logic (fallback if RTK-init didn't fire)
         if pf.phase == Phase.UNINIT:
             top1_name = coarse_names[0] if coarse_names else ""
             top1_sim  = coarse_sims[0]  if coarse_sims  else 0.0

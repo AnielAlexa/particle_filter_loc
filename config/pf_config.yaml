@@ -10,15 +10,15 @@ enu_origin:
   lon: 21.1928
 
 particle_filter:
-  n_dispersed: 200
-  n_tracking: 100
+  n_dispersed: 300               # combo_F: more particles for noise robustness (was 200)
+  n_tracking: 150                # combo_F: (was 100)
   sigma_pos_dispersed: 2.0
-  sigma_pos_tracking: 0.3
+  sigma_pos_tracking: 1.0       # tuned: best avg across noise levels (was 0.5)
   sigma_hdg_dispersed: 10.0
   sigma_hdg_tracking: 2.0
   # Drift noise: simulates VIO-like uncertainty, forces PF to rely on matching
-  drift_noise_m_per_s: 0.3        # m/√s position drift — good VIO (ORB-SLAM3 class)
-  drift_noise_hdg_per_s: 0.5      # deg/√s heading drift
+  drift_noise_m_per_s: 2.0        # tuned: best avg at sub=3 across noise levels (was 1.5)
+  drift_noise_hdg_per_s: 3.0      # 1.5x position drift
   sigma_obs_coarse: 10.0         # tight coarse pull
   sigma_obs_fine: 5.0            # tighter fine now that PnP bias is fixed
   top_k_coarse: 5
@@ -42,8 +42,13 @@ particle_filter:
   static_threshold_m: 0.15         # RTK delta below this = static
   static_sigma_scale: 0.1          # process noise multiplier when static
   # Fine match consistency gate (0 = disabled)
-  fine_consistency_max_m: 20.0     # reject fine matches > 20m from PF estimate
+  fine_consistency_max_m: 40.0     # combo_F: wider gate for drift tolerance (was 20)
   fine_force_inliers: 0             # disabled
+  # Roughening: jitter after resampling to prevent particle collapse
+  roughen_enabled: true
+  roughen_scale: 2.0              # tuned: best noise robustness (was 0.5)
+  # Student-t likelihood: mild outlier robustness (nu>100 = Gaussian)
+  likelihood_nu: 5.0
 
 trust:
   # Signal weights (must sum to 1.0)
@@ -63,8 +68,8 @@ trust:
   # Signal 7: Inlier flow geometry
   geometry_weight: 0.15
   # Sigma modulation
-  sigma_min_scale: 0.5
-  sigma_max_scale: 3.0
+  sigma_min_scale: 0.3           # combo_F: wider range (was 0.5)
+  sigma_max_scale: 5.0           # combo_F: (was 3.0)
   # Drift detection
   drift_pf_confidence_threshold: 0.3
   drift_recon_sim_threshold: 0.20
@@ -142,7 +147,7 @@ replay:
   yaw_topic: "/m300/rtk/yaw"
   altimeter_topic: "/altimeter/range"
   start_offset_s: 50.0        # skip this many seconds from bag start
-  camera_subsample: 1
+  camera_subsample: 3           # tuned: best avg across noise levels (~7Hz at 20Hz camera)
   altitude_min_process_m: 50.0  # skip camera frames if median altitude below this
   output_csv: "results/pf_results.csv"
   output_plot: "results/pf_trajectory.png"

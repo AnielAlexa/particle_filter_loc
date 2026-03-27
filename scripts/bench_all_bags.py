@@ -117,6 +117,8 @@ def main():
                         help="Limit frames per bag (for debugging)")
     parser.add_argument("--altitude-min", type=float, default=None,
                         help="Override altitude_min_process_m for all bags")
+    parser.add_argument("--rtk-noise", type=float, default=0.0,
+                        help="Add Gaussian noise to RTK deltas (sigma in meters, simulates VIO)")
     args = parser.parse_args()
 
     bags_yaml = yaml.safe_load(open(args.bags))
@@ -156,6 +158,7 @@ def main():
                     cache_path=str(cache_file),
                     altitude_min_override=args.altitude_min,
                     bag_name=bag_name,
+                    rtk_noise_m=args.rtk_noise,
                 )
             else:
                 summary = run_replay(
@@ -164,6 +167,7 @@ def main():
                     altitude_min_override=args.altitude_min,
                     max_frames=args.max_frames,
                     bag_name=bag_name,
+                    rtk_noise_m=args.rtk_noise,
                 )
         except Exception as exc:
             print(f"[bench] ERROR on {bag_name}: {exc}")
