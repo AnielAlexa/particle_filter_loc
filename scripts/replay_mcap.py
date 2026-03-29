@@ -4,6 +4,7 @@
 import argparse
 import copy
 import csv
+import math
 import os
 import pickle
 import sys
@@ -434,11 +435,25 @@ def run_replay(
                 # Use the center-crop square size so satellite_crop matches the drone
                 # image (which is center-cropped from cam_w×cam_h → crop×crop → 320×320)
                 cam_crop = min(cam_w, cam_h)
+
+                # Dynamic mosaic context scale: expand with PF spread so the mosaic
+                # covers the actual position uncertainty.
+                # scale = 1 + 2*spread/footprint_diag, floored at 1.5, capped at 4.0.
+                # At tight tracking (~5m spread): ~1.5x → high resolution.
+                # At converging (~40m spread):    ~2.5x → covers uncertainty.
+                # At near-lost  (~80m spread):     4.0x (cap) → wide recovery area.
+                _fw = current_altitude_m * cam_crop / cam_fx
+                _fh = current_altitude_m * cam_crop / cam_fy
+                _fdiag = math.sqrt(_fw ** 2 + _fh ** 2)
+                _spread = pf.weighted_spread()
+                _context_scale = max(1.5, min(4.0, 1.0 + 2.0 * _spread / _fdiag))
+
                 fp_recon = reconstructor.reconstruct(
                     est_lat_prev, est_lon_prev, current_altitude_m,
                     est_hdg_prev + heading_offset_deg,
                     cam_fx, cam_fy, cam_crop, cam_crop,
                     output_size=(320, 320),
+                    mosaic_context_scale=_context_scale,
                 )
 
             # --- Trust: coarse sims + reconstructed similarity ---

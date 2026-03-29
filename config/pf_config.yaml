@@ -131,7 +131,7 @@ matchers:
   camera_cx: 151.1
   camera_cy: 221.9
   context_enabled: true
-  context_fraction: 0.3
+  context_fraction: 0.2
   fine_conf_threshold: 0.20
   min_inliers_ransac: 4
   min_inliers: 8
@@ -141,7 +141,7 @@ init:
   lock_sim_threshold: 0.3  # minimum sim to count as a hit
 
 replay:
-  mcap_path: "/media/aniel/storage/bags_jetson/3b12c33fb6c0c824e5461dc5656404cc/Day4.2_0.mcap"
+  mcap_path: "/media/aniel/storage/bags_jetson/095c6d2c7237fe986c6240628b6ef8dd/Day2.6_0.mcap"
   camera_topic: "/camera/image_mono"
   rtk_topic: "/m300/rtk/fix"
   yaw_topic: "/m300/rtk/yaw"
