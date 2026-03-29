@@ -1,5 +1,6 @@
 """Satellite footprint reconstruction from GPS + heading + altitude."""
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -20,10 +21,12 @@ class FootprintReconstruction:
     source_tiles: List[str] = field(default_factory=list)
     mosaic_bgr: Optional[np.ndarray] = None       # raw North-up stitched mosaic
     mosaic_meta: Optional[dict] = None             # {min_lat, max_lat, min_lon, max_lon, h, w}
-    mosaic_rotated: Optional[np.ndarray] = None    # mosaic rotated to drone orientation
+    mosaic_rotated: Optional[np.ndarray] = None    # heading-aligned square crop, no black
     rotation_center_px: Optional[Tuple[float, float]] = None  # (cx, cy) in North-up mosaic
     heading_deg: float = 0.0                       # heading used for rotation
     warp_M_inv: Optional[np.ndarray] = None        # inverse perspective: satellite_crop px → mosaic px
+    # Inverse affine: mosaic_rotated px → North-up mosaic px (2x3 matrix)
+    rot_crop_M_inv: Optional[np.ndarray] = None
 
 
 class SatelliteFootprintReconstructor:
@@ -90,36 +93,49 @@ class SatelliteFootprintReconstructor:
         fx: float, fy: float,
         img_w: int, img_h: int,
         output_size: Tuple[int, int] = (480, 640),
+        mosaic_context_scale: float = 2.0,
     ) -> Optional[FootprintReconstruction]:
         """Reconstruct satellite view matching drone camera footprint.
 
         Args:
-            output_size: (height, width) of output image.
+            output_size: (height, width) of output image (satellite_crop).
+            mosaic_context_scale: how many times the footprint diagonal
+                the heading-aligned mosaic square should cover.  Default 2.0
+                means the square side = 2x the footprint diagonal.
         """
-        # 1. Compute footprint corners in GPS
+        footprint_w_m = altitude_m * img_w / fx
+        footprint_h_m = altitude_m * img_h / fy
+
+        # 1. Compute footprint corners in GPS (for satellite_crop perspective warp)
         corners_gps = compute_footprint_corners_gps(
             fx, fy, img_w, img_h, altitude_m, heading_deg,
             lat, lon, self.enu,
         )
 
-        footprint_w_m = altitude_m * img_w / fx
-        footprint_h_m = altitude_m * img_h / fy
+        # 2. Determine mosaic extent.
+        #    The heading-aligned output is a square of side S (meters).
+        #    To guarantee no black after any rotation, the North-up mosaic
+        #    must cover a circle of radius S*sqrt(2)/2 around the drone.
+        footprint_diag_m = math.sqrt(footprint_w_m**2 + footprint_h_m**2)
+        square_side_m = footprint_diag_m * mosaic_context_scale
+        mosaic_radius_m = square_side_m * math.sqrt(2) / 2.0
 
-        # 2. Axis-aligned bounding box with margin
-        margin_deg = 0.0005  # ~50m margin
-        min_lat = corners_gps[:, 0].min() - margin_deg
-        max_lat = corners_gps[:, 0].max() + margin_deg
-        min_lon = corners_gps[:, 1].min() - margin_deg
-        max_lon = corners_gps[:, 1].max() + margin_deg
+        lat_rad = math.radians(lat)
+        radius_lat = mosaic_radius_m / 111320.0
+        radius_lon = mosaic_radius_m / (111320.0 * math.cos(lat_rad))
 
-        # 3. Stitch mosaic covering the bounding box
+        min_lat = lat - radius_lat
+        max_lat = lat + radius_lat
+        min_lon = lon - radius_lon
+        max_lon = lon + radius_lon
+
+        # 3. Stitch mosaic covering the circle bounding box
         mosaic, mosaic_meta, source_tiles = self._stitch_mosaic(
             min_lat, max_lat, min_lon, max_lon,
         )
         if mosaic is None:
             return None
 
-        # 4. Map GPS corners → mosaic pixel coords
         m_min_lat = mosaic_meta["min_lat"]
         m_max_lat = mosaic_meta["max_lat"]
         m_min_lon = mosaic_meta["min_lon"]
@@ -127,6 +143,11 @@ class SatelliteFootprintReconstructor:
         m_h = mosaic_meta["h"]
         m_w = mosaic_meta["w"]
 
+        # Drone position in North-up mosaic pixel space
+        center_px_x = (lon - m_min_lon) / (m_max_lon - m_min_lon) * (m_w - 1)
+        center_px_y = (m_max_lat - lat) / (m_max_lat - m_min_lat) * (m_h - 1)
+
+        # 4. Perspective warp for satellite_crop (unchanged logic)
         src_pts = np.zeros((4, 2), dtype=np.float32)
         for i in range(4):
             c_lat, c_lon = corners_gps[i]
@@ -134,7 +155,6 @@ class SatelliteFootprintReconstructor:
             py = (m_max_lat - c_lat) / (m_max_lat - m_min_lat) * (m_h - 1)
             src_pts[i] = [px, py]
 
-        # 5. Perspective warp to output_size
         out_h, out_w = output_size
         dst_pts = np.array([
             [0, 0],
@@ -152,20 +172,34 @@ class SatelliteFootprintReconstructor:
             borderValue=(0, 0, 0),
         )
 
-        # 6. Rotate mosaic to drone orientation for fine matching
-        #    Drone image "up" = forward = heading direction.
-        #    Mosaic is North-up. Rotate mosaic by -heading so its "up" = heading.
-        center_px_x = (lon - m_min_lon) / (m_max_lon - m_min_lon) * (m_w - 1)
-        center_px_y = (m_max_lat - lat) / (m_max_lat - m_min_lat) * (m_h - 1)
+        # 5. Heading-aligned square mosaic: rotate + crop in one warpAffine.
+        #    Output is S×S pixels centered on drone, "up" = heading direction.
+        #    The pre-rotation mosaic is large enough that no black appears.
+        gsd_lon = (m_max_lon - m_min_lon) / (m_w - 1) * 111320.0 * math.cos(lat_rad)
+        gsd_lat = (m_max_lat - m_min_lat) / (m_h - 1) * 111320.0
+        gsd = (gsd_lon + gsd_lat) / 2.0  # meters per pixel
+        S = max(64, int(round(square_side_m / gsd)))
+
+        # Build combined affine: rotate by heading around drone center,
+        # then translate so drone center lands at (S/2, S/2).
         rot_mat = cv2.getRotationMatrix2D(
             (float(center_px_x), float(center_px_y)), heading_deg, 1.0,
         )
+        # After rotation the center stays at (center_px_x, center_px_y).
+        # Shift so it lands at the middle of the S×S output.
+        rot_mat[0, 2] += S / 2.0 - center_px_x
+        rot_mat[1, 2] += S / 2.0 - center_px_y
+
         mosaic_rot = cv2.warpAffine(
-            mosaic, rot_mat, (m_w, m_h),
+            mosaic, rot_mat, (S, S),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=(0, 0, 0),
         )
+
+        # Inverse affine: mosaic_rot px → North-up mosaic px
+        M_fwd_3x3 = np.vstack([rot_mat, [0.0, 0.0, 1.0]])
+        rot_crop_M_inv = np.linalg.inv(M_fwd_3x3)[:2]  # [2, 3]
 
         return FootprintReconstruction(
             satellite_crop=warped,
@@ -179,6 +213,7 @@ class SatelliteFootprintReconstructor:
             rotation_center_px=(float(center_px_x), float(center_px_y)),
             heading_deg=heading_deg,
             warp_M_inv=M_inv,
+            rot_crop_M_inv=rot_crop_M_inv,
         )
 
     def _stitch_mosaic(

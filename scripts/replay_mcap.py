@@ -479,13 +479,12 @@ def run_replay(
                 # B) Fine match on heading-rotated mosaic
                 if (fp_recon is not None and
                         fp_recon.mosaic_rotated is not None and
-                        fp_recon.rotation_center_px is not None):
+                        fp_recon.rot_crop_M_inv is not None):
                     mosaic_fine = obs.fine_match_on_mosaic(
                         frame_bgr,
                         fp_recon.mosaic_rotated,
                         fp_recon.mosaic_meta,
-                        fp_recon.rotation_center_px,
-                        fp_recon.heading_deg,
+                        fp_recon.rot_crop_M_inv,
                     )
 
                 # C) Fine match on coarse top-1 patch

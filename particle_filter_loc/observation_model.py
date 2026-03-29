@@ -440,16 +440,14 @@ class ObservationModel:
         frame_bgr: np.ndarray,
         mosaic_rotated: np.ndarray,
         mosaic_meta: dict,
-        rotation_center_px: tuple,
-        heading_deg_rot: float,
+        rot_crop_M_inv: np.ndarray,
     ) -> Optional[FineResult]:
-        """Fine match drone frame against a heading-rotated satellite mosaic.
+        """Fine match drone frame against a heading-aligned square mosaic.
 
-        The mosaic has been rotated by heading_deg_rot around rotation_center_px
-        so that "up" in the mosaic aligns with the drone's forward direction.
-        Matched keypoints are un-rotated back to North-up before GPS conversion.
-
-        mosaic_meta: GPS bounds of the original North-up mosaic.
+        mosaic_rotated: square, heading-aligned crop (no black regions).
+        rot_crop_M_inv: [2,3] affine that maps mosaic_rotated pixel coords
+            back to the North-up mosaic pixel coords for GPS conversion.
+        mosaic_meta: GPS bounds and pixel size of the North-up mosaic.
         """
         res = self.matcher_resolution
         mh, mw = mosaic_rotated.shape[:2]
@@ -487,29 +485,24 @@ class ObservationModel:
         # Compute flow geometry metrics on pre-RANSAC confidence-filtered matches
         flow_metrics = compute_flow_metrics(mkpts0, mkpts1)
 
-        # Scale keypoints from matcher res to mosaic pixel space (rotated)
+        # Scale keypoints from matcher res to mosaic_rotated pixel space
         mkpts1_rot = mkpts1 * np.array([[mw / res, mh / res]], dtype=np.float32)
 
-        # Un-rotate keypoints back to North-up mosaic space
-        # Inverse of rotation by +heading around center = rotation by -heading
-        cx, cy = rotation_center_px
-        angle_rad = math.radians(-heading_deg_rot)  # undo the rotation
-        cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
-        dx = mkpts1_rot[:, 0] - cx
-        dy = mkpts1_rot[:, 1] - cy
-        mkpts1_northup = np.column_stack([
-            cx + dx * cos_a - dy * sin_a,
-            cy + dx * sin_a + dy * cos_a,
-        ]).astype(np.float32)
+        # Map back to North-up mosaic pixel space via inverse affine
+        ones = np.ones((len(mkpts1_rot), 1), dtype=np.float32)
+        pts_h = np.hstack([mkpts1_rot, ones])  # [N, 3]
+        mkpts1_northup = (rot_crop_M_inv @ pts_h.T).T.astype(np.float32)  # [N, 2]
 
-        # Build flat_meta for the North-up mosaic (original GPS bounds)
+        # flat_meta uses the North-up mosaic dimensions for GPS conversion
+        northup_h = mosaic_meta["h"]
+        northup_w = mosaic_meta["w"]
         flat_meta = {
             "min_lat": mosaic_meta["min_lat"],
             "max_lat": mosaic_meta["max_lat"],
             "min_lon": mosaic_meta["min_lon"],
             "max_lon": mosaic_meta["max_lon"],
-            "patch_h": mh,
-            "patch_w": mw,
+            "patch_h": northup_h,
+            "patch_w": northup_w,
         }
 
         lat, lon, inliers, method, heading_deg_out = None, None, 0, "homography", None
@@ -524,10 +517,10 @@ class ObservationModel:
         if lat is None:
             if len(mkpts0) < 4:
                 return None
-            # Homography on North-up keypoints
+            # Homography: scale drone kpts to North-up mosaic space, match against North-up patch kpts
+            mkpts0_scaled = mkpts0 * np.array([[northup_w / res, northup_h / res]], dtype=np.float32)
             H_northup, hm = cv2.findHomography(
-                mkpts0 * np.array([[mw / res, mh / res]], dtype=np.float32),
-                mkpts1_northup, cv2.RANSAC, 5.0,
+                mkpts0_scaled, mkpts1_northup, cv2.RANSAC, 5.0,
             )
             if H_northup is None:
                 return None
@@ -535,24 +528,21 @@ class ObservationModel:
             if inliers < self.min_inliers_ransac:
                 return None
             # Map drone center through homography to get GPS
-            cx_d = mw / 2.0
-            cy_d = mh / 2.0
+            cx_d = northup_w / 2.0
+            cy_d = northup_h / 2.0
             pt = np.array([[[cx_d, cy_d]]], dtype=np.float32)
             pt_res = cv2.perspectiveTransform(pt, H_northup)[0][0]
-            px = max(0.0, min(float(mw - 1), float(pt_res[0])))
-            py = max(0.0, min(float(mh - 1), float(pt_res[1])))
-            lat = flat_meta["max_lat"] - py * (flat_meta["max_lat"] - flat_meta["min_lat"]) / (mh - 1)
-            lon = flat_meta["min_lon"] + px * (flat_meta["max_lon"] - flat_meta["min_lon"]) / (mw - 1)
+            px = max(0.0, min(float(northup_w - 1), float(pt_res[0])))
+            py = max(0.0, min(float(northup_h - 1), float(pt_res[1])))
+            lat = flat_meta["max_lat"] - py * (flat_meta["max_lat"] - flat_meta["min_lat"]) / (northup_h - 1)
+            lon = flat_meta["min_lon"] + px * (flat_meta["max_lon"] - flat_meta["min_lon"]) / (northup_w - 1)
             method = "homography"
             vis_mask = hm.ravel().astype(bool)
         else:
-            # PnP succeeded: compute homography in 320px space just for viz inlier mask
             if len(mkpts0) >= 4:
                 _, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
                 if hm is not None:
                     vis_mask = hm.ravel().astype(bool)
-            # Fallback: if homography degenerate, use conf-filtered matches as-is
-            # (already geometric inliers from PnP; homography just refines viz)
 
         if inliers < self.min_inliers:
             return None
@@ -561,8 +551,6 @@ class ObservationModel:
             vis0 = mkpts0[vis_mask]
             vis1 = mkpts1_rot[vis_mask]
         else:
-            # No homography mask available — subsample to avoid showing all
-            # conf-filtered matches (some may be non-inliers in the viz)
             vis0 = mkpts0
             vis1 = mkpts1_rot
             if len(vis0) > 80:
