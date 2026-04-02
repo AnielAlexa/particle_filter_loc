@@ -34,6 +34,9 @@ class PFConfig:
     tracking_spread_m: float = 20.0
     lost_spread_m: float = 150.0
     fine_every_n_frames: int = 3
+    # Cascade early-exit: stop fine matching once any result reaches this inlier count.
+    # Satellite → mosaic → coarse patch; skip remaining if good enough.
+    fine_early_exit_inliers: int = 20
     fine_min_inliers_heading: int = 12
     min_search_radius_m: float = 40.0
     search_radius_multiplier: float = 2.5

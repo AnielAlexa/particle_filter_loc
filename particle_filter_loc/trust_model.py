@@ -16,25 +16,19 @@ import numpy as np
 class TrustConfig:
     # Signal 1: Inlier score
     inlier_tau: float = 25.0
-    inlier_weight: float = 0.35
+    inlier_weight: float = 0.39
     # Signal 2: Similarity score
     sim_floor: float = 0.10
     sim_ceiling: float = 0.55
-    sim_weight: float = 0.20
+    sim_weight: float = 0.22
     # Signal 3: PF consistency
-    consistency_weight: float = 0.10
+    consistency_weight: float = 0.11
     consistency_min_radius_m: float = 30.0
-    # Signal 4: Cross-agreement
-    agreement_weight: float = 0.05
-    agreement_scale_m: float = 40.0
-    # Signal 5: Altitude
-    altitude_weight: float = 0.10
+    # Signal 5: Altitude (signals 4/6 removed; weights redistributed to sum=1.0)
+    altitude_weight: float = 0.11
     altitude_ref_m: float = 60.0
-    # Signal 6: Temporal consistency
-    temporal_weight: float = 0.05
-    temporal_max_speed_m_s: float = 15.0
     # Signal 7: Inlier flow geometry
-    geometry_weight: float = 0.15
+    geometry_weight: float = 0.17
     # Sigma modulation
     sigma_min_scale: float = 1.0
     sigma_max_scale: float = 5.0
@@ -89,13 +83,13 @@ class CandidateScore:
     inliers: int
     heading_deg: Optional[float]
     source: str
-    # Individual signal scores
+    # Individual signal scores (agreement/temporal removed — always 0.0)
     inlier_score: float = 0.0
     sim_score: float = 0.0
     consistency_score: float = 0.0
-    agreement_score: float = 0.0
+    agreement_score: float = 0.0   # kept for CSV compat, not computed
     altitude_score: float = 0.0
-    temporal_score: float = 0.0
+    temporal_score: float = 0.0    # kept for CSV compat, not computed
     geometry_score: float = 0.0
     # Combined
     confidence: float = 0.0
@@ -137,10 +131,7 @@ def score_candidate(
     pf_north: float,
     pf_spread: float,
     lost_spread: float,
-    other_candidates_enu: List[Tuple[float, float]],
     altitude_m: float,
-    prev_best_enu: Optional[Tuple[float, float]],
-    dt_s: float,
     cfg: TrustConfig,
     flow_consistency: float = 0.0,
     flow_magnitude_cv: float = 1.0,
@@ -170,31 +161,10 @@ def score_candidate(
         dist = math.sqrt((east_m - pf_east) ** 2 + (north_m - pf_north) ** 2)
         cs.consistency_score = math.exp(-0.5 * (dist / effective_radius) ** 2)
 
-    # Signal 4: Cross-agreement — reward agreement with other candidates
-    if len(other_candidates_enu) == 0:
-        cs.agreement_score = 0.5  # neutral for single candidate
-    else:
-        min_dist = min(
-            math.sqrt((east_m - oe) ** 2 + (north_m - on) ** 2)
-            for oe, on in other_candidates_enu
-        )
-        cs.agreement_score = math.exp(-min_dist / cfg.agreement_scale_m)
-
     # Signal 5: Altitude — higher altitude = less precise
     cs.altitude_score = _clamp(
         cfg.altitude_ref_m / max(altitude_m, 1.0), 0.3, 1.0
     )
-
-    # Signal 6: Temporal consistency — distance from previous best
-    if prev_best_enu is None:
-        cs.temporal_score = 0.5  # neutral
-    else:
-        dt_dist = math.sqrt(
-            (east_m - prev_best_enu[0]) ** 2 + (north_m - prev_best_enu[1]) ** 2
-        )
-        max_move = cfg.temporal_max_speed_m_s * max(dt_s, 0.01)
-        scale = max(max_move * 2.0, 10.0)
-        cs.temporal_score = math.exp(-0.5 * (dt_dist / scale) ** 2)
 
     # Signal 7: Inlier flow geometry — coherence of displacement vectors
     # flow_consistency: R ∈ [0,1], 1 = perfectly parallel (correct match)
@@ -218,14 +188,12 @@ def score_candidate(
     else:
         cs.geometry_score = 0.3  # neutral when no geometry data available
 
-    # Combined: weighted geometric mean
+    # Combined: weighted geometric mean (5 signals; agreement+temporal removed)
     signals = [
         (cs.inlier_score, cfg.inlier_weight),
         (cs.sim_score, cfg.sim_weight),
         (cs.consistency_score, cfg.consistency_weight),
-        (cs.agreement_score, cfg.agreement_weight),
         (cs.altitude_score, cfg.altitude_weight),
-        (cs.temporal_score, cfg.temporal_weight),
         (cs.geometry_score, cfg.geometry_weight),
     ]
     log_conf = sum(w * math.log(max(s, 1e-10)) for s, w in signals)
@@ -249,8 +217,6 @@ class TrustTracker:
         self.cfg = cfg
         self.recon_sim_ema: float = 0.0
         self.pf_self_confidence_ema: float = 0.5
-        self.prev_best_enu: Optional[Tuple[float, float]] = None
-        self.prev_best_ts: Optional[float] = None
         self._initialized = False
         # Global correction state
         self._recon_diverge_count: int = 0
@@ -295,11 +261,6 @@ class TrustTracker:
             and top1_sim >= self.cfg.drift_coarse_sim_min
         )
 
-        # Compute dt from previous frame
-        dt_s = 0.0
-        if self.prev_best_ts is not None:
-            dt_s = timestamp_s - self.prev_best_ts
-
         # Normalize candidates to dicts (support legacy 5-tuples)
         candidates = []
         for c in fine_candidates:
@@ -311,9 +272,6 @@ class TrustTracker:
                     "east_m": c[0], "north_m": c[1], "inliers": c[2],
                     "heading_deg": c[3], "source": c[4],
                 })
-
-        # Build list of all candidate positions for cross-agreement
-        all_enu = [(c["east_m"], c["north_m"]) for c in candidates]
 
         result = FrameTrust(
             drift_detected=drift_detected,
@@ -337,9 +295,6 @@ class TrustTracker:
             else:
                 sim = top1_sim
 
-            # Other candidates for cross-agreement (exclude self)
-            others = [(oe, on) for oe, on in all_enu if (oe, on) != (e, n)]
-
             # When drift, force consistency to 1.0 for coarse candidates
             effective_spread = lost_spread + 1.0 if drift_detected else pf_spread
 
@@ -348,10 +303,7 @@ class TrustTracker:
                 heading_deg=hdg, source=source, sim=sim,
                 pf_east=pf_east, pf_north=pf_north,
                 pf_spread=effective_spread, lost_spread=lost_spread,
-                other_candidates_enu=others,
                 altitude_m=altitude_m,
-                prev_best_enu=self.prev_best_enu,
-                dt_s=dt_s,
                 cfg=self.cfg,
                 flow_consistency=c.get("flow_consistency", 0.0),
                 flow_magnitude_cv=c.get("flow_magnitude_cv", 1.0),
@@ -364,11 +316,6 @@ class TrustTracker:
             best = max(result.all_scores, key=lambda s: s.confidence)
             if best.confidence >= self.cfg.min_confidence:
                 result.best = best
-
-        # Update temporal state
-        if result.best is not None:
-            self.prev_best_enu = (result.best.east_m, result.best.north_m)
-            self.prev_best_ts = timestamp_s
 
         return result
 

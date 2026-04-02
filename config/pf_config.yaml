@@ -13,21 +13,22 @@ particle_filter:
   n_dispersed: 300               # combo_F: more particles for noise robustness (was 200)
   n_tracking: 150                # combo_F: (was 100)
   sigma_pos_dispersed: 2.0
-  sigma_pos_tracking: 1.0       # tuned: best avg across noise levels (was 0.5)
+  sigma_pos_tracking: 3.0       # VIO-tuned: wide process noise for drift robustness (was 1.0)
   sigma_hdg_dispersed: 10.0
   sigma_hdg_tracking: 2.0
   # Drift noise: simulates VIO-like uncertainty, forces PF to rely on matching
   drift_noise_m_per_s: 0       # tuned: best avg at sub=3 across noise levels (was 1.5)
   drift_noise_hdg_per_s: 0.0      # 1.5x position drift
   sigma_obs_coarse: 10.0         # tight coarse pull
-  sigma_obs_fine: 10.0           # tuned: wider = gentler pulls, -32% jitter (was 5)
+  sigma_obs_fine: 5.0            # VIO-tuned: tight obs pull to correct drift (was 10)
   top_k_coarse: 5
   ess_threshold_fraction: 0.5
   init_altitude_m: 50.0          # match altitude_min_process_m; RTK-init doesn't need VPR
   converge_spread_m: 40.0        # enter CONVERGING earlier
   tracking_spread_m: 20.0        # enter TRACKING earlier
   lost_spread_m: 150.0
-  fine_every_n_frames: 1
+  fine_every_n_frames: 3          # jetson: every 3rd frame in TRACKING (was 2)
+  fine_early_exit_inliers: 15    # jetson: cascade — stop fine matching once inliers >= this
   fine_min_inliers_heading: 12
   # Adaptive search (driven by particle spread)
   min_search_radius_m: 40.0
@@ -46,27 +47,26 @@ particle_filter:
   fine_force_inliers: 0             # disabled
   # Roughening: jitter after resampling to prevent particle collapse
   roughen_enabled: true
-  roughen_scale: 0.5              # tuned: smooth trajectory, low jitter (was 2.0)
+  roughen_scale: 2.0              # VIO-tuned: prevents particle collapse under drift (was 0.5)
   # Student-t likelihood: mild outlier robustness (nu>100 = Gaussian)
   likelihood_nu: 5.0
 
 trust:
-  # Signal weights (must sum to 1.0)
+  # Recon similarity: compute cosine sim between drone frame and reconstructed satellite crop
+  # Feeds drift detection + coarse teleport suppression. Disabled = save ~4ms/frame.
+  recon_sim_enabled: false
+  # Signal weights (must sum to 1.0); agreement+temporal removed — redistributed
   inlier_tau: 25.0
-  inlier_weight: 0.35
+  inlier_weight: 0.39
   sim_floor: 0.10
   sim_ceiling: 0.55
-  sim_weight: 0.20
-  consistency_weight: 0.10
+  sim_weight: 0.22
+  consistency_weight: 0.11
   consistency_min_radius_m: 30.0
-  agreement_weight: 0.05
-  agreement_scale_m: 40.0
-  altitude_weight: 0.10
+  altitude_weight: 0.11
   altitude_ref_m: 60.0
-  temporal_weight: 0.05
-  temporal_max_speed_m_s: 15.0
   # Signal 7: Inlier flow geometry
-  geometry_weight: 0.15
+  geometry_weight: 0.17
   # Sigma modulation
   sigma_min_scale: 0.3           # combo_F: wider range (was 0.5)
   sigma_max_scale: 5.0           # combo_F: (was 3.0)
@@ -88,7 +88,7 @@ trust:
   coarse_max_teleport_fraction: 0.8
   coarse_teleport_sigma_range: [15.0, 30.0]
   # Global correction: relocalize from coarse+fine when reconstruction diverges
-  global_corr_enabled: true
+  global_corr_enabled: false      # jetson: disabled — adds complexity with rare benefit
   global_corr_recon_sim_threshold: 0.15   # recon_sim below this = "divergent"
   global_corr_min_frames: 3               # consecutive divergent frames to trigger
   global_corr_min_inliers: 10             # coarse-patch fine must have >= this
@@ -119,6 +119,7 @@ matchers:
   boq_database_path: "data/descriptors_boq/boq_descriptors.pt"
   patch_names_path: "data/descriptors_boq/patch_names.txt"
   # ─────────────────────────────────────────────────────────────────────
+  ransac_max_iters: 1000          # jetson: cap findHomography iterations (cv2 default=2000)
   fine_engine_path: "MatchAnything/matchanything_eloftr_320.trt"
   use_pytorch_matcher: false         # true = PyTorch FP32, false = TRT
   fine_ckpt_path: "MatchAnything/matchanything_eloftr.ckpt"

@@ -4,6 +4,8 @@ import importlib.util
 import json
 import math
 import re
+import time
+from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -14,6 +16,30 @@ import torch
 import torch.nn.functional as F
 
 from .geo_utils import ENUFrame, haversine_m
+
+# Fine-grained profiling for fine match substeps
+_fine_prof: Dict[str, list] = defaultdict(list)
+
+
+def print_fine_profile():
+    """Print fine match substep profiling summary."""
+    if not _fine_prof:
+        return
+    print(f"\n{'='*60}")
+    print(f"  FINE MATCH SUBSTEP PROFILE")
+    print(f"{'='*60}")
+    print(f"  {'substep':<20s} {'n':>5s} {'mean':>7s} {'med':>7s} {'p90':>7s} {'total':>8s}")
+    print(f"  {'-'*20} {'-'*5} {'-'*7} {'-'*7} {'-'*7} {'-'*8}")
+    for key in ["sat_preproc", "sat_trt", "sat_ransac_pnp",
+                "patch_load", "patch_preproc", "patch_trt", "patch_ransac_pnp"]:
+        vals = _fine_prof.get(key, [])
+        if not vals:
+            continue
+        import numpy as _np
+        arr = _np.array(vals)
+        print(f"  {key:<20s} {len(arr):5d} {_np.mean(arr):6.1f}ms {_np.median(arr):6.1f}ms "
+              f"{_np.percentile(arr, 90):6.1f}ms {_np.sum(arr):7.0f}ms")
+    print(f"{'='*60}\n")
 
 
 def _center_crop_square(frame: np.ndarray) -> np.ndarray:
@@ -125,8 +151,13 @@ class ObservationModel:
         self.fine_conf_threshold = config.get("fine_conf_threshold", 0.20)
         self.min_inliers_ransac = config.get("min_inliers_ransac", 4)
         self.min_inliers = config.get("min_inliers", 8)
+        self.ransac_max_iters = config.get("ransac_max_iters", 1000)
         self.image_size = config.get("image_size", 256)
         self.grayscale = config.get("grayscale", True)
+
+        # LRU cache for patch images (avoids repeated disk reads)
+        self._patch_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._patch_cache_max = config.get("patch_cache_size", 100)
 
         # ── Coarse matcher: VLAD TRT / VLAD PyTorch / BoQ TRT ──────────
         use_vlad = config.get("use_vlad", False)
@@ -322,6 +353,7 @@ class ObservationModel:
         res = self.matcher_resolution
 
         # Build patch image + metadata
+        _t_load = time.perf_counter()
         if self.context_enabled:
             result = self._build_context_patch(patch_name, context_fraction)
             if result is None:
@@ -331,8 +363,7 @@ class ObservationModel:
             raw = self.gps_metadata.get(patch_name)
             if raw is None:
                 return None
-            patch_path = self.patches_dir / (patch_name + ".png")
-            patch_bgr = cv2.imread(str(patch_path))
+            patch_bgr = self._load_patch(patch_name)
             if patch_bgr is None:
                 return None
             ph, pw = patch_bgr.shape[:2]
@@ -342,11 +373,13 @@ class ObservationModel:
                 "min_lon": b["min_lon"], "max_lon": b["max_lon"],
                 "patch_h": ph, "patch_w": pw,
             }
+        _fine_prof["patch_load"].append((time.perf_counter() - _t_load) * 1000)
 
         patch_h = flat_meta["patch_h"]
         patch_w = flat_meta["patch_w"]
 
         # Center-crop drone frame to square, then resize
+        _t_pre = time.perf_counter()
         frame_cropped = _center_crop_square(frame_bgr)
         q_gray = cv2.cvtColor(
             cv2.resize(frame_cropped, (res, res)), cv2.COLOR_BGR2GRAY
@@ -356,11 +389,14 @@ class ObservationModel:
         ).astype(np.float32) / 255.0
         q_np = q_gray[np.newaxis, np.newaxis]
         p_np = p_gray[np.newaxis, np.newaxis]
+        _fine_prof["patch_preproc"].append((time.perf_counter() - _t_pre) * 1000)
 
+        _t_trt = time.perf_counter()
         try:
             out = self.matcher.infer(q_np, p_np)
         except Exception:
             return None
+        _fine_prof["patch_trt"].append((time.perf_counter() - _t_trt) * 1000)
 
         mkpts0 = out.get("keypoints0")
         mkpts1 = out.get("keypoints1")
@@ -384,6 +420,7 @@ class ObservationModel:
         mkpts1_patch = mkpts1 * np.array([[patch_w / res, patch_h / res]], dtype=np.float32)
 
         # --- PnP ---
+        _t_ransac = time.perf_counter()
         lat, lon, inliers, method, heading_deg = None, None, 0, "homography", None
 
         if len(mkpts0) >= self.min_inliers_ransac:
@@ -397,7 +434,8 @@ class ObservationModel:
         if lat is None:
             if len(mkpts0) < 4:
                 return None
-            H, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
+            H, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0,
+                                        None, self.ransac_max_iters)
             if H is None:
                 return None
             inliers = int(hm.sum())
@@ -412,9 +450,11 @@ class ObservationModel:
         else:
             # PnP: compute homography just for inlier mask (visualization only)
             if len(mkpts0) >= 4:
-                _, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
+                _, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0,
+                                           None, self.ransac_max_iters)
                 if hm is not None:
                     vis_mask = hm.ravel().astype(bool)
+        _fine_prof["patch_ransac_pnp"].append((time.perf_counter() - _t_ransac) * 1000)
 
         if inliers < self.min_inliers:
             return None
@@ -521,6 +561,7 @@ class ObservationModel:
             mkpts0_scaled = mkpts0 * np.array([[northup_w / res, northup_h / res]], dtype=np.float32)
             H_northup, hm = cv2.findHomography(
                 mkpts0_scaled, mkpts1_northup, cv2.RANSAC, 5.0,
+                None, self.ransac_max_iters,
             )
             if H_northup is None:
                 return None
@@ -540,7 +581,8 @@ class ObservationModel:
             vis_mask = hm.ravel().astype(bool)
         else:
             if len(mkpts0) >= 4:
-                _, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
+                _, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0,
+                                           None, self.ransac_max_iters)
                 if hm is not None:
                     vis_mask = hm.ravel().astype(bool)
 
@@ -586,6 +628,7 @@ class ObservationModel:
         res = self.matcher_resolution
         sh, sw = satellite_crop.shape[:2]
 
+        _t_pre = time.perf_counter()
         frame_cropped = _center_crop_square(frame_bgr)
         q_gray = cv2.cvtColor(
             cv2.resize(frame_cropped, (res, res)), cv2.COLOR_BGR2GRAY
@@ -595,11 +638,14 @@ class ObservationModel:
         ).astype(np.float32) / 255.0
         q_np = q_gray[np.newaxis, np.newaxis]
         p_np = p_gray[np.newaxis, np.newaxis]
+        _fine_prof["sat_preproc"].append((time.perf_counter() - _t_pre) * 1000)
 
+        _t_trt = time.perf_counter()
         try:
             out = self.matcher.infer(q_np, p_np)
         except Exception:
             return None
+        _fine_prof["sat_trt"].append((time.perf_counter() - _t_trt) * 1000)
 
         mkpts0 = out.get("keypoints0")
         mkpts1 = out.get("keypoints1")
@@ -639,6 +685,7 @@ class ObservationModel:
             "patch_w": mw,
         }
 
+        _t_ransac = time.perf_counter()
         lat, lon, inliers, method, heading_deg = None, None, 0, "homography", None
 
         if len(mkpts0) >= self.min_inliers_ransac:
@@ -654,6 +701,7 @@ class ObservationModel:
             H_northup, hm = cv2.findHomography(
                 mkpts0 * np.array([[mw / res, mh / res]], dtype=np.float32),
                 mkpts1_northup, cv2.RANSAC, 5.0,
+                None, self.ransac_max_iters,
             )
             if H_northup is None:
                 return None
@@ -672,10 +720,12 @@ class ObservationModel:
         else:
             # PnP succeeded: compute homography in 320px space just for viz inlier mask
             if len(mkpts0) >= 4:
-                _, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0)
+                _, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0,
+                                           None, self.ransac_max_iters)
                 if hm is not None:
                     vis_mask = hm.ravel().astype(bool)
             # Fallback: if homography degenerate, use conf-filtered matches as-is
+        _fine_prof["sat_ransac_pnp"].append((time.perf_counter() - _t_ransac) * 1000)
 
         if inliers < self.min_inliers:
             return None
@@ -857,6 +907,20 @@ class ObservationModel:
     # Context patch stitching
     # ------------------------------------------------------------------
 
+    def _load_patch(self, name: str) -> Optional[np.ndarray]:
+        """Load a patch image with LRU caching."""
+        if name in self._patch_cache:
+            self._patch_cache.move_to_end(name)
+            return self._patch_cache[name]
+        path = self.patches_dir / (name + ".png")
+        img = cv2.imread(str(path))
+        if img is None:
+            return None
+        self._patch_cache[name] = img
+        if len(self._patch_cache) > self._patch_cache_max:
+            self._patch_cache.popitem(last=False)
+        return img
+
     def _build_context_patch(
         self, center_name: str, context_fraction: float,
     ) -> Optional[Tuple[np.ndarray, dict]]:
@@ -871,8 +935,7 @@ class ObservationModel:
 
         center_bounds = raw["bounds"]
 
-        center_path = self.patches_dir / (center_name + ".png")
-        center_img = cv2.imread(str(center_path))
+        center_img = self._load_patch(center_name)
         if center_img is None:
             return None
         tile_h, tile_w = center_img.shape[:2]
@@ -914,8 +977,7 @@ class ObservationModel:
             if is_center:
                 timg = center_img
             else:
-                tpath = self.patches_dir / (nname + ".png")
-                timg = cv2.imread(str(tpath))
+                timg = self._load_patch(nname)
                 if timg is None:
                     continue
 

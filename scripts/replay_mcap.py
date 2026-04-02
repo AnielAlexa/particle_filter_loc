@@ -25,7 +25,7 @@ sys.path.insert(0, str(PKG_DIR))
 from particle_filter_loc.geo_utils import ENUFrame, haversine_m
 from particle_filter_loc.motion_model import RTKMotionModel, MotionDelta
 from particle_filter_loc.particle_filter import PFConfig, ParticleFilter, Phase
-from particle_filter_loc.observation_model import ObservationModel
+from particle_filter_loc.observation_model import ObservationModel, print_fine_profile
 from particle_filter_loc.debug_viz import DebugVisualizer
 from particle_filter_loc.footprint_reconstruction import SatelliteFootprintReconstructor
 from particle_filter_loc.trust_model import (
@@ -77,6 +77,7 @@ def run_replay(
                    "trust_cross_agree_m", "trust_drift_recon_sim", "trust_drift_coarse_sim",
                    "coarse_trust_sim", "coarse_trust_fraction", "coarse_trust_sigma"}
     trust_cfg_dict = cfg.get("trust", {})
+    recon_sim_enabled = trust_cfg_dict.pop("recon_sim_enabled", True)
     # Handle coarse_teleport_sigma_range as list
     trust_config = TrustConfig(**trust_cfg_dict)
     trust_tracker = TrustTracker(trust_config)
@@ -198,6 +199,11 @@ def run_replay(
     _dbg_offset_done = False
     _dbg_alt_init_printed = False
     _dbg_camera_count = 0
+
+    # Per-stage CPU profiling accumulators (lists of ms)
+    _prof = {"coarse": [], "recon": [], "recon_sim": [], "fine_sat": [],
+             "fine_mosaic": [], "fine_patch": [], "trust": [], "pf_update": [],
+             "viz": [], "total": []}
 
     for schema, channel, message, decoded_msg in reader.iter_decoded_messages(topics=topics):
         topic = channel.topic
@@ -378,6 +384,7 @@ def run_replay(
                 continue
 
             # --- Coarse match (adaptive radius) ---
+            _t0 = time.perf_counter()
             est_e, est_n, est_hdg = pf.estimate()
             search_radius = pf.get_search_radius()
 
@@ -390,6 +397,7 @@ def run_replay(
 
             coarse = obs.coarse_match(frame_bgr, candidate_indices=candidate_indices,
                                        top_k=pf_config.top_k_coarse)
+            _prof["coarse"].append((time.perf_counter() - _t0) * 1000)
 
             # Visualizer cache
             viz.coarse_name = coarse.top_k_names[0] if coarse.top_k_names else ""
@@ -430,6 +438,7 @@ def run_replay(
                     )
 
             # --- Reconstruct satellite mosaic (single call for fine matching + viz) ---
+            _t0 = time.perf_counter()
             fp_recon = None
             if est_lat_prev is not None:
                 # Use the center-crop square size so satellite_crop matches the drone
@@ -456,13 +465,19 @@ def run_replay(
                     mosaic_context_scale=_context_scale,
                 )
 
+            _prof["recon"].append((time.perf_counter() - _t0) * 1000)
+
             # --- Trust: coarse sims + reconstructed similarity ---
+            _t0 = time.perf_counter()
             top1_sim = coarse.top_k_sims[0] if coarse.top_k_sims else 0.0
             top2_sim = coarse.top_k_sims[1] if len(coarse.top_k_sims) > 1 else 0.0
             coarse_gap = top1_sim - top2_sim
             recon_sim = 0.0
             if fp_recon is not None:
-                recon_sim = obs.compute_similarity(frame_bgr, fp_recon.satellite_crop)
+                if recon_sim_enabled:
+                    recon_sim = obs.compute_similarity(frame_bgr, fp_recon.satellite_crop)
+                else:
+                    recon_sim = trust_config.sim_ceiling  # neutral: sim_score=1.0
                 viz.satellite_footprint = fp_recon.satellite_crop
                 viz.footprint_confidence = recon_sim
                 viz.footprint_info_str = (
@@ -471,8 +486,10 @@ def run_replay(
                 )
             else:
                 viz.satellite_footprint = None
+            _prof["recon_sim"].append((time.perf_counter() - _t0) * 1000)
 
             # --- Fine match (adaptive) ---
+            _t_fine_start = time.perf_counter()
             frame_trust = None
             fine_result = None
             sat_fine = None
@@ -482,7 +499,10 @@ def run_replay(
                 fine_attempted += 1
                 obs.altitude_m = current_altitude_m  # keep PnP altitude init accurate
 
-                # A) Fine match on satellite crop (perspective-warped to drone FOV)
+                _early_exit = pf_config.fine_early_exit_inliers
+
+                # A) Satellite (perspective-warped to drone FOV) — best geometry, try first
+                _t_fs = time.perf_counter()
                 if (fp_recon is not None and fp_recon.warp_M_inv is not None):
                     sat_fine = obs.fine_match_on_satellite(
                         frame_bgr,
@@ -490,23 +510,33 @@ def run_replay(
                         fp_recon.mosaic_meta,
                         fp_recon.warp_M_inv,
                     )
+                _prof["fine_sat"].append((time.perf_counter() - _t_fs) * 1000)
 
-                # B) Fine match on heading-rotated mosaic
-                if (fp_recon is not None and
-                        fp_recon.mosaic_rotated is not None and
-                        fp_recon.rot_crop_M_inv is not None):
-                    mosaic_fine = obs.fine_match_on_mosaic(
-                        frame_bgr,
-                        fp_recon.mosaic_rotated,
-                        fp_recon.mosaic_meta,
-                        fp_recon.rot_crop_M_inv,
-                    )
+                # B) Mosaic — skip if satellite already got enough inliers
+                _t_fm = time.perf_counter()
+                if (sat_fine is None or sat_fine.inliers < _early_exit):
+                    if (fp_recon is not None and
+                            fp_recon.mosaic_rotated is not None and
+                            fp_recon.rot_crop_M_inv is not None):
+                        mosaic_fine = obs.fine_match_on_mosaic(
+                            frame_bgr,
+                            fp_recon.mosaic_rotated,
+                            fp_recon.mosaic_meta,
+                            fp_recon.rot_crop_M_inv,
+                        )
+                _prof["fine_mosaic"].append((time.perf_counter() - _t_fm) * 1000)
 
-                # C) Fine match on coarse top-1 patch
-                if coarse.top_k_names:
+                # C) Coarse top-1 patch — skip if satellite or mosaic was good enough
+                _t_fp = time.perf_counter()
+                _best_recon_inliers = max(
+                    sat_fine.inliers if sat_fine is not None else 0,
+                    mosaic_fine.inliers if mosaic_fine is not None else 0,
+                )
+                if _best_recon_inliers < _early_exit and coarse.top_k_names:
                     ctx_frac = pf.get_context_fraction()
                     patch_fine = obs.fine_match(frame_bgr, coarse.top_k_names[0],
                                                context_fraction=ctx_frac)
+                _prof["fine_patch"].append((time.perf_counter() - _t_fp) * 1000)
 
                 # Store results for visualization
                 best_mosaic = None
@@ -575,6 +605,7 @@ def run_replay(
                             "inlier_ratio": patch_fine.inlier_ratio,
                         })
 
+                _t_trust = time.perf_counter()
                 frame_trust = trust_tracker.evaluate_frame(
                     fine_candidates=all_fine,
                     recon_sim=recon_sim,
@@ -585,7 +616,9 @@ def run_replay(
                     altitude_m=current_altitude_m,
                     timestamp_s=elapsed_s,
                 )
+                _prof["trust"].append((time.perf_counter() - _t_trust) * 1000)
 
+                _t_pfu = time.perf_counter()
                 if frame_trust.best is not None:
                     best_cs = frame_trust.best
                     fine_result = best_cs  # for logging below
@@ -609,6 +642,7 @@ def run_replay(
                         viz.fine_matched_name = "REJECTED"
                 else:
                     viz.fine_matched_name = "NO_TRUST"
+                _prof["pf_update"].append((time.perf_counter() - _t_pfu) * 1000)
 
             # --- Global correction: relocalize from coarse+fine when recon diverges ---
             global_corr = None
@@ -660,13 +694,16 @@ def run_replay(
             spread = pf.weighted_spread()
 
             t_frame_ms = (time.monotonic() - t_frame_start) * 1000
+            _prof["total"].append(t_frame_ms)
             elapsed_s_frame = (ts_ns - t_start) * 1e-9
 
             # Debug visualization
+            _t_viz = time.perf_counter()
             gt_e = enu.wgs84_to_enu(gt_lat, gt_lon)[0] if gt_lat is not None else None
             gt_n = enu.wgs84_to_enu(gt_lat, gt_lon)[1] if gt_lat is not None else None
             viz.update(pf, frame_bgr, error_m=error_m, elapsed_s=elapsed_s_frame,
                        gt_east=gt_e, gt_north=gt_n)
+            _prof["viz"].append((time.perf_counter() - _t_viz) * 1000)
 
             # Extract trust info for logging
             _best_cs = frame_trust.best if frame_trust else None
@@ -807,10 +844,38 @@ def run_replay(
     bag_file.close()
     viz.close()
 
+    # ---- CPU profiling summary ----
+    if _prof["total"]:
+        print(f"\n{'='*60}")
+        print(f"  CPU PROFILE SUMMARY  ({len(_prof['total'])} frames)")
+        print(f"{'='*60}")
+        print(f"  {'Stage':<16s} {'mean':>7s} {'med':>7s} {'p90':>7s} {'p99':>7s} {'total':>8s}  {'%':>5s}")
+        print(f"  {'-'*16} {'-'*7} {'-'*7} {'-'*7} {'-'*7} {'-'*8}  {'-'*5}")
+        _total_sum = sum(_prof["total"])
+        for key in ["coarse", "recon", "recon_sim", "fine_sat", "fine_mosaic",
+                     "fine_patch", "trust", "pf_update", "viz", "total"]:
+            vals = _prof[key]
+            if not vals:
+                continue
+            arr = np.array(vals)
+            _mean = np.mean(arr)
+            _med = np.median(arr)
+            _p90 = np.percentile(arr, 90)
+            _p99 = np.percentile(arr, 99)
+            _sum = np.sum(arr)
+            _pct = 100.0 * _sum / _total_sum if _total_sum > 0 else 0
+            sep = "=" if key == "total" else " "
+            print(f"{sep} {'TOTAL' if key == 'total' else key:<16s} "
+                  f"{_mean:6.1f}ms {_med:6.1f}ms {_p90:6.1f}ms {_p99:6.1f}ms "
+                  f"{_sum:7.0f}ms  {_pct:5.1f}%")
+        print(f"{'='*60}\n")
+
+    print_fine_profile()
+
     # ---- Write cache ----
     if save_cache and cache_frames:
         header = {
-            "__cache_version__": 3,
+            "__cache_version__": 4,
             "bag_name": bag_name,
             "mcap_path": mcap_path,
             "start_offset_s": start_offset_s,
@@ -840,6 +905,7 @@ def _replay_from_cache(
     output_csv: str,
     output_plot: str,
     rtk_noise_m: float = 0.0,
+    drift_bias_m_per_s: float = 0.0,
 ) -> dict:
     """PF-only replay from a match cache file. No TRT, no MCAP."""
     print(f"[cache] Loading: {cache_path}")
@@ -869,6 +935,11 @@ def _replay_from_cache(
     _lock_sims  = []
     t_start_ns  = cache_frames[0]["timestamp_ns"] if cache_frames else 0
 
+    # Drift bias: pick a random direction once, apply constant offset per second
+    _drift_angle = np.random.uniform(0, 2 * np.pi) if drift_bias_m_per_s > 0 else 0.0
+    _drift_dx = drift_bias_m_per_s * np.cos(_drift_angle)
+    _drift_dy = drift_bias_m_per_s * np.sin(_drift_angle)
+
     for frame in cache_frames:
         ts_ns   = frame["timestamp_ns"]
         alt     = frame["altitude_m"]
@@ -880,10 +951,10 @@ def _replay_from_cache(
         for d in frame.get("rtk_deltas", []):
             if pf.particles is not None:
                 delta = MotionDelta(**d)
-                if rtk_noise_m > 0.0:
+                if rtk_noise_m > 0.0 or drift_bias_m_per_s > 0.0:
                     delta = MotionDelta(
-                        dx_m=delta.dx_m + np.random.normal(0, rtk_noise_m),
-                        dy_m=delta.dy_m + np.random.normal(0, rtk_noise_m),
+                        dx_m=delta.dx_m + np.random.normal(0, rtk_noise_m) + _drift_dx * delta.dt_s,
+                        dy_m=delta.dy_m + np.random.normal(0, rtk_noise_m) + _drift_dy * delta.dt_s,
                         heading_deg=delta.heading_deg + np.random.normal(0, rtk_noise_m * 2.0),
                         dt_s=delta.dt_s,
                     )
