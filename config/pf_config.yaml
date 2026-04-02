@@ -92,7 +92,8 @@ trust:
   global_corr_recon_sim_threshold: 0.15   # recon_sim below this = "divergent"
   global_corr_min_frames: 3               # consecutive divergent frames to trigger
   global_corr_min_inliers: 10             # coarse-patch fine must have >= this
-  global_corr_max_spread_m: 50.0          # only when PF has tight spread
+  global_corr_min_spread_m: 15.0          # don't fire when PF is tight/confident (< this)
+  global_corr_max_spread_m: 50.0          # don't fire when PF is too dispersed (> this)
   global_corr_position_consistency_m: 40.0 # coarse-fine positions must agree within this
   global_corr_cooldown_frames: 10          # min frames between corrections
   global_corr_teleport_fraction: 0.35      # fraction of particles injected as competing hypothesis

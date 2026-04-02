@@ -59,6 +59,15 @@ class TrustConfig:
     global_corr_cooldown_frames: int = 10
     global_corr_teleport_fraction: float = 0.35
     global_corr_teleport_sigma: float = 10.0
+    # Minimum PF spread to allow a global correction.
+    # Prevents firing when the filter is tight and stable (just systematically
+    # offset) — injecting a wrong correction cluster into a confident filter
+    # is worse than doing nothing.
+    global_corr_min_spread_m: float = 15.0
+    # Coarse validation: correction target must be within this distance of the
+    # current coarse top-1 match position. Rejects corrections whose target
+    # is not supported by the coarse descriptor.  Set to 0.0 to disable.
+    global_corr_coarse_validation_m: float = 40.0
     # EMA smoothing
     ema_alpha: float = 0.3
     # Minimum confidence to apply any update
@@ -411,6 +420,14 @@ class TrustTracker:
         # Tick cooldown
         if self._global_correction_cooldown > 0:
             self._global_correction_cooldown -= 1
+
+        # Spread guard: if the filter is tight and confident, don't fire.
+        # A low spread means PF is tracking well — poor recon_sim may just
+        # be lighting/angle mismatch, not a real drift.
+        if pf_spread < cfg.global_corr_min_spread_m:
+            self._recon_diverge_count = 0
+            self._coarse_fine_hits.clear()
+            return None
 
         # Accumulate or reset
         divergent = (
