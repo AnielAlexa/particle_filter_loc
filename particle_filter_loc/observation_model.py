@@ -159,6 +159,11 @@ class ObservationModel:
         self._patch_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._patch_cache_max = config.get("patch_cache_size", 100)
 
+        # Debug flag: set to True to enable verbose PnP prints
+        self._debug_pnp = config.get("debug_pnp", False)
+        # Skip the visualization-only homography after PnP success (saves ~5-15ms/fine call)
+        self._skip_viz_homography = config.get("skip_viz_homography", True)
+
         # ── Coarse matcher: VLAD TRT / VLAD PyTorch / BoQ TRT ──────────
         use_vlad = config.get("use_vlad", False)
         use_vlad_trt = config.get("use_vlad_trt", False)
@@ -200,7 +205,7 @@ class ObservationModel:
             self.db_descriptors = data.get("descriptors", data.get("boq_descriptors", list(data.values())[0]))
         else:
             self.db_descriptors = data
-        self.db_descriptors = F.normalize(self.db_descriptors.float().cuda(), dim=1)
+        self.db_descriptors = F.normalize(self.db_descriptors.float(), dim=1)
         self.n_patches = self.db_descriptors.shape[0]
 
         # Optional PCA dimensionality reduction (VLAD paths only)
@@ -214,8 +219,8 @@ class ObservationModel:
             pca_path = db_path.parent / "pca_components.pt"
             if pca_path.exists():
                 pca_data = torch.load(str(pca_path), map_location="cuda")
-                self._pca_mean = pca_data["mean"].cuda()
-                self._pca_components = pca_data["components"][:pca_dim].cuda()
+                self._pca_mean = pca_data["mean"]
+                self._pca_components = pca_data["components"][:pca_dim]
                 k = self._pca_components.shape[0]
                 orig_dim = self.db_descriptors.shape[1]
                 self.db_descriptors = F.normalize(
@@ -304,6 +309,18 @@ class ObservationModel:
     # Coarse matching
     # ------------------------------------------------------------------
 
+    def prepare_query_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """Preprocess query frame once per camera frame for all fine match calls.
+
+        Returns q_np: float32 [1, 1, res, res] normalized to [0, 1].
+        """
+        res = self.matcher_resolution
+        frame_cropped = _center_crop_square(frame_bgr)
+        q_gray = cv2.cvtColor(
+            cv2.resize(frame_cropped, (res, res)), cv2.COLOR_BGR2GRAY
+        ).astype(np.float32) / 255.0
+        return q_gray[np.newaxis, np.newaxis]
+
     def coarse_match(self, frame_bgr: np.ndarray,
                      candidate_indices: Optional[List[int]] = None,
                      top_k: int = 5) -> CoarseResult:
@@ -349,7 +366,8 @@ class ObservationModel:
     # ------------------------------------------------------------------
 
     def fine_match(self, frame_bgr: np.ndarray, patch_name: str,
-                   context_fraction: float = 0.4) -> Optional[FineResult]:
+                   context_fraction: float = 0.4,
+                   q_np: Optional[np.ndarray] = None) -> Optional[FineResult]:
         res = self.matcher_resolution
 
         # Build patch image + metadata
@@ -378,16 +396,17 @@ class ObservationModel:
         patch_h = flat_meta["patch_h"]
         patch_w = flat_meta["patch_w"]
 
-        # Center-crop drone frame to square, then resize
+        # Center-crop drone frame to square, then resize (skip if pre-computed)
         _t_pre = time.perf_counter()
-        frame_cropped = _center_crop_square(frame_bgr)
-        q_gray = cv2.cvtColor(
-            cv2.resize(frame_cropped, (res, res)), cv2.COLOR_BGR2GRAY
-        ).astype(np.float32) / 255.0
+        if q_np is None:
+            frame_cropped = _center_crop_square(frame_bgr)
+            q_gray = cv2.cvtColor(
+                cv2.resize(frame_cropped, (res, res)), cv2.COLOR_BGR2GRAY
+            ).astype(np.float32) / 255.0
+            q_np = q_gray[np.newaxis, np.newaxis]
         p_gray = cv2.cvtColor(
             cv2.resize(patch_bgr, (res, res)), cv2.COLOR_BGR2GRAY
         ).astype(np.float32) / 255.0
-        q_np = q_gray[np.newaxis, np.newaxis]
         p_np = p_gray[np.newaxis, np.newaxis]
         _fine_prof["patch_preproc"].append((time.perf_counter() - _t_pre) * 1000)
 
@@ -449,7 +468,7 @@ class ObservationModel:
             vis_mask = hm.ravel().astype(bool)
         else:
             # PnP: compute homography just for inlier mask (visualization only)
-            if len(mkpts0) >= 4:
+            if not self._skip_viz_homography and len(mkpts0) >= 4:
                 _, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0,
                                            None, self.ransac_max_iters)
                 if hm is not None:
@@ -481,6 +500,7 @@ class ObservationModel:
         mosaic_rotated: np.ndarray,
         mosaic_meta: dict,
         rot_crop_M_inv: np.ndarray,
+        q_np: Optional[np.ndarray] = None,
     ) -> Optional[FineResult]:
         """Fine match drone frame against a heading-aligned square mosaic.
 
@@ -492,14 +512,15 @@ class ObservationModel:
         res = self.matcher_resolution
         mh, mw = mosaic_rotated.shape[:2]
 
-        frame_cropped = _center_crop_square(frame_bgr)
-        q_gray = cv2.cvtColor(
-            cv2.resize(frame_cropped, (res, res)), cv2.COLOR_BGR2GRAY
-        ).astype(np.float32) / 255.0
+        if q_np is None:
+            frame_cropped = _center_crop_square(frame_bgr)
+            q_gray = cv2.cvtColor(
+                cv2.resize(frame_cropped, (res, res)), cv2.COLOR_BGR2GRAY
+            ).astype(np.float32) / 255.0
+            q_np = q_gray[np.newaxis, np.newaxis]
         p_gray = cv2.cvtColor(
             cv2.resize(mosaic_rotated, (res, res)), cv2.COLOR_BGR2GRAY
         ).astype(np.float32) / 255.0
-        q_np = q_gray[np.newaxis, np.newaxis]
         p_np = p_gray[np.newaxis, np.newaxis]
 
         try:
@@ -580,7 +601,7 @@ class ObservationModel:
             method = "homography"
             vis_mask = hm.ravel().astype(bool)
         else:
-            if len(mkpts0) >= 4:
+            if not self._skip_viz_homography and len(mkpts0) >= 4:
                 _, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0,
                                            None, self.ransac_max_iters)
                 if hm is not None:
@@ -618,6 +639,7 @@ class ObservationModel:
         satellite_crop: np.ndarray,
         mosaic_meta: dict,
         warp_M_inv: np.ndarray,
+        q_np: Optional[np.ndarray] = None,
     ) -> Optional[FineResult]:
         """Fine match drone frame against the perspective-warped satellite crop.
 
@@ -629,14 +651,15 @@ class ObservationModel:
         sh, sw = satellite_crop.shape[:2]
 
         _t_pre = time.perf_counter()
-        frame_cropped = _center_crop_square(frame_bgr)
-        q_gray = cv2.cvtColor(
-            cv2.resize(frame_cropped, (res, res)), cv2.COLOR_BGR2GRAY
-        ).astype(np.float32) / 255.0
+        if q_np is None:
+            frame_cropped = _center_crop_square(frame_bgr)
+            q_gray = cv2.cvtColor(
+                cv2.resize(frame_cropped, (res, res)), cv2.COLOR_BGR2GRAY
+            ).astype(np.float32) / 255.0
+            q_np = q_gray[np.newaxis, np.newaxis]
         p_gray = cv2.cvtColor(
             cv2.resize(satellite_crop, (res, res)), cv2.COLOR_BGR2GRAY
         ).astype(np.float32) / 255.0
-        q_np = q_gray[np.newaxis, np.newaxis]
         p_np = p_gray[np.newaxis, np.newaxis]
         _fine_prof["sat_preproc"].append((time.perf_counter() - _t_pre) * 1000)
 
@@ -719,7 +742,7 @@ class ObservationModel:
             vis_mask = hm.ravel().astype(bool)
         else:
             # PnP succeeded: compute homography in 320px space just for viz inlier mask
-            if len(mkpts0) >= 4:
+            if not self._skip_viz_homography and len(mkpts0) >= 4:
                 _, hm = cv2.findHomography(mkpts0, mkpts1, cv2.RANSAC, 5.0,
                                            None, self.ransac_max_iters)
                 if hm is not None:
@@ -764,8 +787,9 @@ class ObservationModel:
         meta: dict,
     ) -> Optional[Tuple[float, float, float]]:
         """Returns (lat, lon, heading_deg) or None."""
-        print(f"[PnP] entry: {len(mkpts_drone)} pts, alt={self.altitude_m:.1f}m, "
-              f"patch=({meta['patch_w']}x{meta['patch_h']})")
+        if self._debug_pnp:
+            print(f"[PnP] entry: {len(mkpts_drone)} pts, alt={self.altitude_m:.1f}m, "
+                  f"patch=({meta['patch_w']}x{meta['patch_h']})")
         min_lat = meta["min_lat"]
         max_lat = meta["max_lat"]
         min_lon = meta["min_lon"]
@@ -806,12 +830,14 @@ class ObservationModel:
                 cv2.SOLVEPNP_ITERATIVE,
             )
         except Exception as e:
-            print(f"[PnP] solvePnPRansac exception: {e}")
+            if self._debug_pnp:
+                print(f"[PnP] solvePnPRansac exception: {e}")
             return None
 
         if not ok or inlier_idx is None or len(inlier_idx) < self.min_inliers_ransac:
-            n_inl = len(inlier_idx) if inlier_idx is not None else 0
-            print(f"[PnP] RANSAC failed: ok={ok}, inliers={n_inl}, min={self.min_inliers_ransac}")
+            if self._debug_pnp:
+                n_inl = len(inlier_idx) if inlier_idx is not None else 0
+                print(f"[PnP] RANSAC failed: ok={ok}, inliers={n_inl}, min={self.min_inliers_ransac}")
             return None
 
         # RANSAC can return ok=True with NaN for coplanar scenes — re-solve with IPPE
@@ -826,10 +852,12 @@ class ObservationModel:
                 if ok_ip and np.all(np.isfinite(rvec_ip)) and np.all(np.isfinite(tvec_ip)):
                     rvec, tvec = rvec_ip, tvec_ip
                 else:
-                    print(f"[PnP] IPPE also failed")
+                    if self._debug_pnp:
+                        print(f"[PnP] IPPE also failed")
                     return None
             except Exception as e:
-                print(f"[PnP] IPPE exception: {e}")
+                if self._debug_pnp:
+                    print(f"[PnP] IPPE exception: {e}")
                 return None
 
         # Refine pose using inliers only (fall back to RANSAC result if refinement diverges)
@@ -850,20 +878,23 @@ class ObservationModel:
         cam_pos = (-R.T @ tvec).flatten()
 
         if not np.all(np.isfinite(cam_pos)):
-            det = np.linalg.det(R)
-            obj_span = obj_pts.max(axis=0) - obj_pts.min(axis=0)
-            img_span = img_pts.max(axis=0) - img_pts.min(axis=0)
-            print(f"[PnP] non-finite cam_pos: rvec={rvec.flatten()}, tvec={tvec.flatten()}, "
-                  f"det(R)={det:.3f}, obj_span={obj_span}, img_span={img_span}, "
-                  f"inliers={len(inlier_idx)}")
+            if self._debug_pnp:
+                det = np.linalg.det(R)
+                obj_span = obj_pts.max(axis=0) - obj_pts.min(axis=0)
+                img_span = img_pts.max(axis=0) - img_pts.min(axis=0)
+                print(f"[PnP] non-finite cam_pos: rvec={rvec.flatten()}, tvec={tvec.flatten()}, "
+                      f"det(R)={det:.3f}, obj_span={obj_span}, img_span={img_span}, "
+                      f"inliers={len(inlier_idx)}")
             return None
 
         # Sanity check: PnP altitude must be within 50% of live altimeter reading
         pnp_alt = float(cam_pos[2])
-        print(f"[PnP] alt_est={pnp_alt:.1f}m  alt_live={self.altitude_m:.1f}m  "
-              f"err={abs(pnp_alt - self.altitude_m):.1f}m  inliers={len(inlier_idx)}")
+        if self._debug_pnp:
+            print(f"[PnP] alt_est={pnp_alt:.1f}m  alt_live={self.altitude_m:.1f}m  "
+                  f"err={abs(pnp_alt - self.altitude_m):.1f}m  inliers={len(inlier_idx)}")
         if self.altitude_m > 0.0 and abs(pnp_alt - self.altitude_m) > self.altitude_m * 0.5:
-            print(f"[PnP] REJECTED (>{self.altitude_m * 0.5:.1f}m threshold)")
+            if self._debug_pnp:
+                print(f"[PnP] REJECTED (>{self.altitude_m * 0.5:.1f}m threshold)")
             return None
 
         cam_lat = center_lat + cam_pos[1] / 111319.5

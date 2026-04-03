@@ -223,6 +223,13 @@ class PFGeoLocNode(rclpy.node.Node):
 
 
 def main(args=None):
+    # Jetson Orin: limit CPU threads — pipeline is GPU-dominated,
+    # small arrays (300 particles, 320px images) don't benefit from parallel BLAS.
+    import torch as _torch
+    _torch.set_num_threads(2)
+    _torch.set_num_interop_threads(1)
+    cv2.setNumThreads(2)
+
     rclpy.init(args=args)
     node = PFGeoLocNode()
     rclpy.spin(node)

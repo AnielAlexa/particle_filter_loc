@@ -17,6 +17,11 @@ def generate_launch_description():
         name="pf_geo_loc_node",
         parameters=[{"config_path": LaunchConfiguration("config_path")}],
         output="screen",
+        additional_env={
+            "OMP_NUM_THREADS": "2",
+            "OPENBLAS_NUM_THREADS": "2",
+            "MKL_NUM_THREADS": "2",
+        },
     )
 
     return LaunchDescription([config_arg, node])

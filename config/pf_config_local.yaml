@@ -13,22 +13,22 @@ particle_filter:
   n_dispersed: 300               # combo_F: more particles for noise robustness (was 200)
   n_tracking: 150                # combo_F: (was 100)
   sigma_pos_dispersed: 2.0
-  sigma_pos_tracking: 3.0       # VIO-tuned: wide process noise for drift robustness (was 1.0)
+  sigma_pos_tracking: 1.0
   sigma_hdg_dispersed: 10.0
   sigma_hdg_tracking: 2.0
   # Drift noise: simulates VIO-like uncertainty, forces PF to rely on matching
   drift_noise_m_per_s: 0       # tuned: best avg at sub=3 across noise levels (was 1.5)
   drift_noise_hdg_per_s: 0.0      # 1.5x position drift
   sigma_obs_coarse: 10.0         # tight coarse pull
-  sigma_obs_fine: 5.0            # VIO-tuned: tight obs pull to correct drift (was 10)
+  sigma_obs_fine: 10.0
   top_k_coarse: 5
   ess_threshold_fraction: 0.5
   init_altitude_m: 50.0          # match altitude_min_process_m; RTK-init doesn't need VPR
   converge_spread_m: 40.0        # enter CONVERGING earlier
   tracking_spread_m: 20.0        # enter TRACKING earlier
   lost_spread_m: 150.0
-  fine_every_n_frames: 3          # jetson: every 3rd frame in TRACKING (was 2)
-  fine_early_exit_inliers: 15    # jetson: cascade — stop fine matching once inliers >= this
+  fine_every_n_frames: 2
+  fine_early_exit_inliers: 10
   fine_min_inliers_heading: 12
   # Adaptive search (driven by particle spread)
   min_search_radius_m: 40.0
@@ -47,12 +47,12 @@ particle_filter:
   fine_force_inliers: 0             # disabled
   # Roughening: jitter after resampling to prevent particle collapse
   roughen_enabled: true
-  roughen_scale: 2.0              # VIO-tuned: prevents particle collapse under drift (was 0.5)
+  roughen_scale: 0.5
   # Student-t likelihood: mild outlier robustness (nu>100 = Gaussian)
   likelihood_nu: 5.0
   # Adaptive param interpolation: blend RTK and VIO params based on
   # observed correction magnitudes. When disabled, uses static values above.
-  adaptive_enabled: true
+  adaptive_enabled: false
   adaptive_ema_alpha: 0.2
   adaptive_drift_low_m: 2.0            # correction/spread ratio EMA below this = RTK
   adaptive_drift_high_m: 4.0           # correction/spread ratio EMA above this = VIO
@@ -112,9 +112,9 @@ trust:
   global_corr_teleport_sigma: 10.0         # spread of teleported particles (m)
 
 matchers:
-  script_dir: "/media/aniel/storage/bags_jetson/vpr_dinov3/dinov2_vits_layer_test"
+  script_dir: "/home/jetson/jetson_ws/vpr_dinov3/dinov2_vits_layer_test"
   # ── Coarse matcher switch ─────────────────────────────────────────────
-  use_vlad: false
+  use_vlad: true
   # VLAD (timm DINOv3 + hard-assignment VLAD, no TRT required)
   vlad_codebook_path:    "data/descriptors_vlad_l10_aerial/vlad_codebook.pt"
   vlad_database_path:    "data/descriptors_vlad_l10_aerial/vlad_descriptors.pt"
@@ -122,9 +122,9 @@ matchers:
   vlad_num_clusters: 16
   vlad_layer_idx: 10
   vlad_image_size: 256
-  vlad_pca_dim: 768            # 0 = no PCA, >0 = PCA whitening to N dims
+  vlad_pca_dim: 0              # no PCA: raw 6144-dim VLAD — test coverage vs descriptor
   # VLAD+PCA TRT (set use_vlad: false, use_vlad_trt: true)
-  use_vlad_trt: true
+  use_vlad_trt: false
   vlad_trt_engine_path: "dinov3_vlad_pca768_l10_value_256.engine"
   # BoQ TRT (set use_vlad: false to restore this path)
   boq_engine_path: "dinov3_lora_gray_boq_l10_value_256.engine"
@@ -155,7 +155,7 @@ init:
   lock_sim_threshold: 0.3  # minimum sim to count as a hit
 
 replay:
-  mcap_path: "/media/aniel/storage/bags_jetson/095c6d2c7237fe986c6240628b6ef8dd/Day2.6_0.mcap"
+  mcap_path: "/home/jetson/jetson_ws/[Day2.6_0.mcap]/095c6d2c7237fe986c6240628b6ef8dd/Day2.6_0.mcap"
   camera_topic: "/camera/image_mono"
   rtk_topic: "/m300/rtk/fix"
   yaw_topic: "/m300/rtk/yaw"

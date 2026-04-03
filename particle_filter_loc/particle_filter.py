@@ -72,6 +72,18 @@ class PFConfig:
     # Student-t likelihood: heavier tails prevent outlier observations from
     # collapsing the particle cloud. Set to large value (>100) for Gaussian.
     likelihood_nu: float = 5.0
+    # Adaptive parameter interpolation: blend RTK-optimal and VIO-optimal params
+    # based on observed correction magnitudes at fine updates.
+    adaptive_enabled: bool = False
+    adaptive_ema_alpha: float = 0.3
+    adaptive_drift_low_m: float = 5.0
+    adaptive_drift_high_m: float = 20.0
+    adaptive_sigma_pos_rtk: float = 0.5
+    adaptive_sigma_obs_fine_rtk: float = 15.0
+    adaptive_roughen_scale_rtk: float = 0.5
+    adaptive_sigma_pos_vio: float = 3.0
+    adaptive_sigma_obs_fine_vio: float = 5.0
+    adaptive_roughen_scale_vio: float = 2.0
 
 
 class ParticleFilter:
@@ -86,6 +98,8 @@ class ParticleFilter:
         self.is_static = False
         self._motion_detected = False  # True once drone has moved since init
         self._cov_sigma_ema: float = 100.0  # EMA-smoothed covariance sigma
+        self._correction_ema: float = 0.0   # EMA of fine correction distance
+        self._drift_factor: float = 0.0     # 0=RTK regime, 1=VIO regime
 
     # ------------------------------------------------------------------
     # Initialization
@@ -151,7 +165,7 @@ class ParticleFilter:
 
         n = len(self.particles)
         if self.phase == Phase.TRACKING:
-            sigma_pos = self.cfg.sigma_pos_tracking
+            sigma_pos = self.adaptive_sigma_pos
             sigma_hdg = self.cfg.sigma_hdg_tracking
         else:
             sigma_pos = self.cfg.sigma_pos_dispersed
@@ -393,6 +407,56 @@ class ParticleFilter:
             self.weights = np.full(len(self.weights), 1.0 / len(self.weights))
         return True
 
+    # ------------------------------------------------------------------
+    # Adaptive parameter interpolation
+    # ------------------------------------------------------------------
+
+    def feed_correction_distance(self, correction_dist_m: float):
+        """Update correction-distance EMA and recompute drift_factor.
+
+        Uses both the correction distance and the current particle spread
+        as signals: spread captures how much the PF diverges between
+        corrections (drift → spread grows), while correction distance
+        captures how far fine matching pulls.
+        """
+        if not self.cfg.adaptive_enabled:
+            return
+        alpha = self.cfg.adaptive_ema_alpha
+        # Use correction distance normalized by spread: if correction >> spread,
+        # fine matching is pulling far relative to PF uncertainty → drift.
+        # On clean RTK: correction ~10m, spread ~5m → ratio ~2.
+        # On VIO drift: correction ~20m+, spread ~5-8m → ratio ~3-4+.
+        spread = max(self.weighted_spread(), 1.0)
+        signal = correction_dist_m / spread
+        self._correction_ema = alpha * signal + (1.0 - alpha) * self._correction_ema
+        low = self.cfg.adaptive_drift_low_m
+        high = self.cfg.adaptive_drift_high_m
+        if high <= low:
+            self._drift_factor = 0.0
+        else:
+            self._drift_factor = max(0.0, min(1.0, (self._correction_ema - low) / (high - low)))
+
+    @property
+    def adaptive_sigma_pos(self) -> float:
+        if not self.cfg.adaptive_enabled:
+            return self.cfg.sigma_pos_tracking
+        f = self._drift_factor
+        return self.cfg.adaptive_sigma_pos_rtk + f * (self.cfg.adaptive_sigma_pos_vio - self.cfg.adaptive_sigma_pos_rtk)
+
+    @property
+    def adaptive_sigma_obs_fine(self) -> float:
+        if not self.cfg.adaptive_enabled:
+            return self.cfg.sigma_obs_fine
+        f = self._drift_factor
+        return self.cfg.adaptive_sigma_obs_fine_rtk + f * (self.cfg.adaptive_sigma_obs_fine_vio - self.cfg.adaptive_sigma_obs_fine_rtk)
+
+    @property
+    def adaptive_roughen_scale(self) -> float:
+        if not self.cfg.adaptive_enabled:
+            return self.cfg.roughen_scale
+        f = self._drift_factor
+        return self.cfg.adaptive_roughen_scale_rtk + f * (self.cfg.adaptive_roughen_scale_vio - self.cfg.adaptive_roughen_scale_rtk)
+
     def apply_global_correction(self, east: float, north: float,
                                 heading_deg: Optional[float] = None,
                                 teleport_fraction: float = 0.35,
@@ -453,7 +517,7 @@ class ParticleFilter:
         # Roughening: add small jitter to prevent particle collapse from
         # duplicate particles after resampling (Musso et al., 2001)
         if self.cfg.roughen_enabled:
-            h = self.cfg.roughen_scale
+            h = self.adaptive_roughen_scale
             spread = self.weighted_spread()
             roughen_pos = max(0.3, h * spread * n ** (-1.0 / 3.0))
             roughen_hdg = max(0.5, h * 10.0 * n ** (-1.0 / 3.0))

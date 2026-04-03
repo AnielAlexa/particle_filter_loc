@@ -501,6 +501,9 @@ def run_replay(
 
                 _early_exit = pf_config.fine_early_exit_inliers
 
+                # Pre-compute query frame once for all three fine match calls
+                fine_q_np = obs.prepare_query_frame(frame_bgr)
+
                 # A) Satellite (perspective-warped to drone FOV) — best geometry, try first
                 _t_fs = time.perf_counter()
                 if (fp_recon is not None and fp_recon.warp_M_inv is not None):
@@ -509,6 +512,7 @@ def run_replay(
                         fp_recon.satellite_crop,
                         fp_recon.mosaic_meta,
                         fp_recon.warp_M_inv,
+                        q_np=fine_q_np,
                     )
                 _prof["fine_sat"].append((time.perf_counter() - _t_fs) * 1000)
 
@@ -523,6 +527,7 @@ def run_replay(
                             fp_recon.mosaic_rotated,
                             fp_recon.mosaic_meta,
                             fp_recon.rot_crop_M_inv,
+                            q_np=fine_q_np,
                         )
                 _prof["fine_mosaic"].append((time.perf_counter() - _t_fm) * 1000)
 
@@ -535,7 +540,8 @@ def run_replay(
                 if _best_recon_inliers < _early_exit and coarse.top_k_names:
                     ctx_frac = pf.get_context_fraction()
                     patch_fine = obs.fine_match(frame_bgr, coarse.top_k_names[0],
-                                               context_fraction=ctx_frac)
+                                               context_fraction=ctx_frac,
+                                               q_np=fine_q_np)
                 _prof["fine_patch"].append((time.perf_counter() - _t_fp) * 1000)
 
                 # Store results for visualization
@@ -623,13 +629,14 @@ def run_replay(
                     best_cs = frame_trust.best
                     fine_result = best_cs  # for logging below
                     eff_sigma = trust_tracker.get_effective_sigma(
-                        best_cs.confidence, pf_config.sigma_obs_fine,
+                        best_cs.confidence, pf.adaptive_sigma_obs_fine,
                         is_static=pf.is_static)
                     eff_kappa = trust_tracker.get_effective_kappa(
                         best_cs.confidence, is_static=pf.is_static)
                     viz.fine_matched_name = best_cs.source
                     viz.footprint_confidence = best_cs.confidence
 
+                    _pre_e, _pre_n, _ = pf.estimate()
                     accepted = pf.update_fine(
                         best_cs.east_m, best_cs.north_m, best_cs.inliers,
                         best_cs.heading_deg,
@@ -637,6 +644,10 @@ def run_replay(
                         kappa_override=eff_kappa,
                     )
                     if accepted:
+                        _corr_dist = math.sqrt(
+                            (best_cs.east_m - _pre_e) ** 2 +
+                            (best_cs.north_m - _pre_n) ** 2)
+                        pf.feed_correction_distance(_corr_dist)
                         fine_succeeded += 1
                     else:
                         viz.fine_matched_name = "REJECTED"
@@ -740,6 +751,11 @@ def run_replay(
                 "recon_sim_ema": frame_trust.recon_sim_ema if frame_trust else 0.0,
                 "global_correction": global_corr is not None,
                 "recon_diverge_count": trust_tracker._recon_diverge_count,
+                "correction_ema": pf._correction_ema,
+                "drift_factor": pf._drift_factor,
+                "adaptive_sigma_pos": pf.adaptive_sigma_pos,
+                "adaptive_sigma_obs": pf.adaptive_sigma_obs_fine,
+                "adaptive_roughen": pf.adaptive_roughen_scale,
             })
 
             # Build cache frame (v2: includes all fine candidates + trust signals)
@@ -1071,16 +1087,22 @@ def _replay_from_cache(
                 )
                 if ft.best is not None:
                     eff_sigma = trust_tracker.get_effective_sigma(
-                        ft.best.confidence, pf_config.sigma_obs_fine,
+                        ft.best.confidence, pf.adaptive_sigma_obs_fine,
                         is_static=pf.is_static)
                     eff_kappa = trust_tracker.get_effective_kappa(
                         ft.best.confidence, is_static=pf.is_static)
-                    pf.update_fine(
+                    _pre_e, _pre_n, _ = pf.estimate()
+                    _accepted = pf.update_fine(
                         ft.best.east_m, ft.best.north_m, ft.best.inliers,
                         ft.best.heading_deg,
                         sigma_override=eff_sigma,
                         kappa_override=eff_kappa,
                     )
+                    if _accepted:
+                        _corr_dist = math.sqrt(
+                            (ft.best.east_m - _pre_e) ** 2 +
+                            (ft.best.north_m - _pre_n) ** 2)
+                        pf.feed_correction_distance(_corr_dist)
                     fine_succeeded += 1
             else:
                 fine_attempted += 1

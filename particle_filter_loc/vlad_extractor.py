@@ -130,14 +130,9 @@ class DINOv3VLADExtractor:
         else:
             frame = frame[:, :, ::-1]  # BGR → RGB
 
-        # HWC uint8 → NCHW float32 [0, 1]
-        tensor = (
-            torch.from_numpy(frame.transpose(2, 0, 1).copy())
-            .unsqueeze(0)
-            .float()
-            .to(self.device)
-            / 255.0
-        )
+        # HWC uint8 → CHW float32 in one contiguous numpy op, then single device transfer
+        chw = np.ascontiguousarray(frame.transpose(2, 0, 1), dtype=np.float32) / 255.0
+        tensor = torch.from_numpy(chw).unsqueeze(0).to(self.device)
         tensor = (tensor - self.mean) / self.std
         return tensor
 

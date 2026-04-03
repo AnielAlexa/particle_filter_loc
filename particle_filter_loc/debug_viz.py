@@ -381,6 +381,11 @@ class DebugVisualizer:
                 self._pf_path = self._pf_path[-self.max_path_len:]
                 self._phase_path = self._phase_path[-self.max_path_len:]
 
+        # Early exit: skip rendering when nothing is being displayed or saved
+        if not self.show_window and not self.save_frames and self.ros_pub is None:
+            self._frame_idx += 1
+            return None
+
         phase = pf.phase
         phase_color = _PHASE_COLOR.get(phase, (255, 255, 255))
 
